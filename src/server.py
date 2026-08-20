@@ -8,8 +8,8 @@ DecayEngine / EmbeddingEngine / ImportEngine，把它们注入 tools._runtime �
 web._shared，然后以 @mcp.tool() 注册薄封装（真正的实现在 src/tools/<工具>/ 下面）。
 
 关键行为：
-- 启动后暴露 16 个 MCP 工具：breath/breath_search/breath_advanced/hold/grow/
-  trace/anchor/release/pulse/plan/letter_write/
+- 启动后暴露 18 个 MCP 工具：breath/breath_search/breath_advanced/hold/grow/
+  trace/anchor/release/pulse/plan/recall/thread/letter_write/
   letter_lock_update/letter_read/dream/feel/I；每个入口
   ≤ 10 行，只负责转发。breath 拆成 breath()(0 参数)+breath_search(3 参数)+
   breath_advanced(9 参数) 三级，是因为 claude.ai 按需加载工具时会跳过参数
@@ -24,7 +24,7 @@ web._shared，然后以 @mcp.tool() 注册薄封装（真正的实现在 src/too
 - 不写 HTTP 路由处理（全在 web/* 下）；不写 LLM prompt（dehydrator 负责）
 - 不直接读写桶文件（bucket_manager 负责）
 
-对外暴露：mcp 单实例 + 16 个 @mcp.tool() 函数；HTTP 路由在 src/web/*
+对外暴露：mcp 单实例 + 18 个 @mcp.tool() 函数；HTTP 路由在 src/web/*
 ========================================
 """
 
@@ -69,6 +69,8 @@ from tools import anchor as _t_anchor
 from tools import plan as _t_plan
 from tools import dream as _t_dream
 from tools import i as _t_i
+from tools import recall as _t_recall
+from tools import thread as _t_thread
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
 config = load_config()
@@ -939,6 +941,26 @@ except (AttributeError, RuntimeError, TypeError, ValueError) as _trace_schema_ex
     logger.warning(
         "trace strict-argument adapter unavailable: %s",
         _trace_schema_exc,
+    )
+
+
+@mcp.tool()
+async def recall(bucket_id: str) -> str:
+    """回想：沿记忆的线往回走。给一条记忆的 bucket_id，返回它的正文 + 一个「路口」——按方向分组的邻居（← 之前 / → 之后 / ≈ 同刻 / ↔ 相关），每条带标题、日期、id，让我能一层层点过去，走到「过去的过去」。只读不写，不建边不改边。找不到关系时会说它还是一颗没被串起来的珍珠。"""
+    return await _with_notice(
+        _t_recall.recall(bucket_id),
+        op="recall",
+        args={"bucket_id": bucket_id},
+    )
+
+
+@mcp.tool()
+async def thread(query: str, max_results: Optional[int] = 0) -> str:
+    """串珠：按话题把散落的记忆串成一条时间线。给一个关键词，把相关记忆按时间排成一条线——最早聊了什么、中间聊了什么、现在聊了什么。每站一行（序号 + 日期 + 标题 + id），0 LLM 调用。想看某站全文，用它的 id 去 recall 或 breath_search 点开。和 recall 是两种回想姿态：recall 沿「事情」走，thread 沿「话题」走。"""
+    return await _with_notice(
+        _t_thread.thread(query, max_results=max_results),
+        op="thread",
+        args={"query": query, "max_results": max_results},
     )
 
 
