@@ -4,9 +4,11 @@ import json
 
 import httpx
 import pytest
+import frontmatter
 
 import github_sync as github_sync_mod
 from github_sync import GitHubSync
+from ombrebrain.storage.source_store import SourceStore
 
 
 def _json_response(method: str, url: str, status_code: int, payload: dict) -> httpx.Response:
@@ -27,6 +29,7 @@ def test_backup_manifest_records_hashes_counts_and_bytes():
 
     assert manifest["schema_version"] == 1
     assert manifest["source"] == "ombre-brain"
+    assert manifest["source_refs_complete"] is True
     assert manifest["repo"] == "owner/repo"
     assert manifest["branch"] == "main"
     assert manifest["path_prefix"] == "ombre"
@@ -35,6 +38,18 @@ def test_backup_manifest_records_hashes_counts_and_bytes():
     by_path = {item["path"]: item for item in manifest["files"]}
     assert by_path["dynamic/a.md"]["sha256"] == hashlib.sha256(b"alpha").hexdigest()
     assert by_path["dynamic/a.md"]["bytes"] == 5
+
+
+def test_backup_manifest_refuses_dangling_source_reference():
+    sync = GitHubSync(token="token", repo="owner/repo")
+    missing_ref = "src_" + "b" * 64
+    bucket = frontmatter.dumps(frontmatter.Post(
+        "event",
+        source_refs=[{"ref": missing_ref, "ranges": [[1, 1]]}],
+    )).encode()
+
+    with pytest.raises(RuntimeError, match="dangling source evidence"):
+        sync._build_backup_manifest({"dynamic/a.md": bucket})
 
 
 @pytest.mark.asyncio
@@ -140,6 +155,236 @@ async def test_import_reads_backup_manifest_summary_when_present(monkeypatch, tm
         "total_bytes": 7,
     }
     assert (tmp_path / "dynamic" / "a.md").read_text(encoding="utf-8") == "# hello"
+
+
+@pytest.mark.asyncio
+async def test_import_restores_verified_source_evidence(monkeypatch, tmp_path):
+    sync = GitHubSync(token="token", repo="owner/repo", branch="main", path_prefix="ombre")
+    source_data = "GitHub 恢复的原文证据".encode()
+    ref = f"src_{hashlib.sha256(source_data).hexdigest()}"
+    relative = f"_sources/{ref}.source"
+    manifest = {
+        "schema_version": 1,
+        "generated_at": "2026-07-28T00:00:00+00:00",
+        "file_count": 1,
+        "total_bytes": len(source_data),
+        "files": [{
+            "path": relative,
+            "bytes": len(source_data),
+            "sha256": hashlib.sha256(source_data).hexdigest(),
+        }],
+    }
+    manifest_data = json.dumps(manifest).encode()
+
+    async def fake_request(_client, method, url, **_kwargs):
+        if url.endswith("/git/ref/heads/main"):
+            return _json_response(method, url, 200, {"object": {"sha": "head-sha"}})
+        if url.endswith("/git/commits/head-sha"):
+            return _json_response(method, url, 200, {"tree": {"sha": "tree-sha"}})
+        if url.endswith("/git/trees/tree-sha?recursive=1"):
+            return _json_response(method, url, 200, {
+                "truncated": False,
+                "tree": [
+                    {
+                        "type": "blob",
+                        "path": "ombre/_ombre_backup_manifest.json",
+                        "sha": "manifest-sha",
+                        "size": len(manifest_data),
+                    },
+                    {
+                        "type": "blob",
+                        "path": f"ombre/{relative}",
+                        "sha": "source-sha",
+                        "size": len(source_data),
+                    },
+                ],
+            })
+        if url.endswith("/git/blobs/manifest-sha"):
+            return _json_response(method, url, 200, {
+                "encoding": "base64",
+                "content": base64.b64encode(manifest_data).decode(),
+            })
+        if url.endswith("/git/blobs/source-sha"):
+            return _json_response(method, url, 200, {
+                "encoding": "base64",
+                "content": base64.b64encode(source_data).decode(),
+            })
+        raise AssertionError(f"Unexpected GitHub API call: {method} {url}")
+
+    monkeypatch.setattr(sync, "_request", fake_request)
+    result = await sync.import_from_github(str(tmp_path))
+
+    assert result["ok"] is True
+    assert result["imported"] == 1
+    assert result["buckets_imported"] == 0
+    assert result["sources_imported"] == 1
+    assert SourceStore(tmp_path).read(ref) == source_data.decode()
+
+
+@pytest.mark.parametrize("declares_complete", [False, True])
+@pytest.mark.asyncio
+async def test_restore_detects_dangling_source_references_before_writing(
+    monkeypatch, tmp_path, declares_complete
+):
+    sync = GitHubSync(
+        token="token", repo="owner/repo", branch="main", path_prefix="ombre"
+    )
+    missing_ref = "src_" + "d" * 64
+    bucket_data = frontmatter.dumps(frontmatter.Post(
+        "remote event",
+        source_refs=[{"ref": missing_ref, "ranges": [[1, 1]]}],
+    )).encode("utf-8")
+    manifest = {
+        "schema_version": 1,
+        "generated_at": "2026-07-28T00:00:00+00:00",
+        "file_count": 1,
+        "total_bytes": len(bucket_data),
+        "files": [{
+            "path": "dynamic/a.md",
+            "bytes": len(bucket_data),
+            "sha256": hashlib.sha256(bucket_data).hexdigest(),
+        }],
+    }
+    if declares_complete:
+        manifest["source_refs_complete"] = True
+    manifest_data = json.dumps(manifest).encode("utf-8")
+    local = tmp_path / "dynamic" / "a.md"
+    local.parent.mkdir()
+    local.write_text("local original", encoding="utf-8")
+
+    async def fake_request(_client, method, url, **_kwargs):
+        if url.endswith("/git/ref/heads/main"):
+            return _json_response(method, url, 200, {"object": {"sha": "head-sha"}})
+        if url.endswith("/git/commits/head-sha"):
+            return _json_response(method, url, 200, {"tree": {"sha": "tree-sha"}})
+        if url.endswith("/git/trees/tree-sha?recursive=1"):
+            return _json_response(method, url, 200, {
+                "truncated": False,
+                "tree": [
+                    {
+                        "type": "blob",
+                        "path": "ombre/_ombre_backup_manifest.json",
+                        "sha": "manifest-sha",
+                        "size": len(manifest_data),
+                    },
+                    {
+                        "type": "blob",
+                        "path": "ombre/dynamic/a.md",
+                        "sha": "bucket-sha",
+                        "size": len(bucket_data),
+                    },
+                ],
+            })
+        if url.endswith("/git/blobs/manifest-sha"):
+            return _json_response(method, url, 200, {
+                "encoding": "base64",
+                "content": base64.b64encode(manifest_data).decode(),
+            })
+        if url.endswith("/git/blobs/bucket-sha"):
+            return _json_response(method, url, 200, {
+                "encoding": "base64",
+                "content": base64.b64encode(bucket_data).decode(),
+            })
+        raise AssertionError(f"Unexpected GitHub API call: {method} {url}")
+
+    monkeypatch.setattr(sync, "_request", fake_request)
+    result = await sync.import_from_github(str(tmp_path))
+
+    if declares_complete:
+        assert result["ok"] is False
+        assert result["imported"] == 0
+        assert "dangling references" in result["error"]
+        assert local.read_text(encoding="utf-8") == "local original"
+    else:
+        assert result["ok"] is True
+        assert "原文证据引用没有对应文件" in result["integrity_warning"]
+        assert local.read_bytes() == bucket_data
+
+
+@pytest.mark.asyncio
+async def test_invalid_source_after_bucket_never_overwrites_markdown(
+    monkeypatch, tmp_path
+):
+    sync = GitHubSync(
+        token="token", repo="owner/repo", branch="main", path_prefix="ombre"
+    )
+    bucket_data = b"remote bucket"
+    expected_source = b"valid source"
+    source_data = b"tampered source"
+    ref = f"src_{hashlib.sha256(expected_source).hexdigest()}"
+    source_rel = f"_sources/{ref}.source"
+    manifest = {
+        "schema_version": 1,
+        "generated_at": "2026-07-28T00:00:00+00:00",
+        "file_count": 2,
+        "total_bytes": len(bucket_data) + len(source_data),
+        "files": [
+            {
+                "path": "dynamic/a.md",
+                "bytes": len(bucket_data),
+                "sha256": hashlib.sha256(bucket_data).hexdigest(),
+            },
+            {
+                "path": source_rel,
+                "bytes": len(source_data),
+                "sha256": hashlib.sha256(source_data).hexdigest(),
+            },
+        ],
+    }
+    manifest_data = json.dumps(manifest).encode()
+    local = tmp_path / "dynamic" / "a.md"
+    local.parent.mkdir()
+    local.write_text("local original", encoding="utf-8")
+
+    async def fake_request(_client, method, url, **_kwargs):
+        if url.endswith("/git/ref/heads/main"):
+            return _json_response(method, url, 200, {"object": {"sha": "head-sha"}})
+        if url.endswith("/git/commits/head-sha"):
+            return _json_response(method, url, 200, {"tree": {"sha": "tree-sha"}})
+        if url.endswith("/git/trees/tree-sha?recursive=1"):
+            return _json_response(method, url, 200, {
+                "truncated": False,
+                # Deliberately put the bucket before the failing source.
+                "tree": [
+                    {
+                        "type": "blob",
+                        "path": "ombre/_ombre_backup_manifest.json",
+                        "sha": "manifest-sha",
+                        "size": len(manifest_data),
+                    },
+                    {
+                        "type": "blob",
+                        "path": "ombre/dynamic/a.md",
+                        "sha": "bucket-sha",
+                        "size": len(bucket_data),
+                    },
+                    {
+                        "type": "blob",
+                        "path": f"ombre/{source_rel}",
+                        "sha": "source-sha",
+                        "size": len(source_data),
+                    },
+                ],
+            })
+        payloads = {
+            "manifest-sha": manifest_data,
+            "bucket-sha": bucket_data,
+            "source-sha": source_data,
+        }
+        for sha, payload in payloads.items():
+            if url.endswith(f"/git/blobs/{sha}"):
+                return _json_response(method, url, 200, {
+                    "encoding": "base64",
+                    "content": base64.b64encode(payload).decode(),
+                })
+        raise AssertionError(f"Unexpected GitHub API call: {method} {url}")
+
+    monkeypatch.setattr(sync, "_request", fake_request)
+    result = await sync.import_from_github(str(tmp_path))
+
+    assert result["ok"] is False
+    assert "source evidence integrity mismatch" in str(result)
+    assert local.read_text(encoding="utf-8") == "local original"
 
 
 @pytest.mark.asyncio

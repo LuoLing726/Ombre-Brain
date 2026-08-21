@@ -355,6 +355,16 @@ async def test_trace_patch_records_plan_edit_change_log(trace_runtime):
         bucket_type="plan",
         weight=0.7,
     )
+    await manager.update(
+        bucket_id,
+        resolution_suggested={
+            "reason": "旧正文可能已完成",
+            "ts": "2026-08-12T12:00:00",
+        },
+    )
+    before = await manager.get(bucket_id)
+    assert before is not None
+    assert "resolution_suggested" in before["metadata"]
 
     result = await trace_core(
         bucket_id,
@@ -366,4 +376,71 @@ async def test_trace_patch_records_plan_edit_change_log(trace_runtime):
     assert "content=已局部替换" in result
     assert bucket is not None
     assert bucket["content"] == "计划新正文"
+    assert "resolution_suggested" not in bucket["metadata"]
     assert bucket["metadata"]["change_log"][-1]["action"] == "edit"
+
+
+@pytest.mark.asyncio
+async def test_trace_plan_status_change_records_actor(trace_runtime):
+    manager = trace_runtime
+    bucket_id = await manager.create(
+        content="待完成计划",
+        bucket_type="plan",
+        weight=0.7,
+    )
+    await manager.update(
+        bucket_id,
+        status="active",
+        change_log=[],
+        resolution_suggested={
+            "reason": "计划可能已完成",
+            "ts": "2026-08-12T12:00:00",
+        },
+    )
+    before = await manager.get(bucket_id)
+    assert before is not None
+    assert "resolution_suggested" in before["metadata"]
+
+    result = await trace_core(bucket_id, status="resolved")
+    bucket = await manager.get(bucket_id)
+
+    assert "status=resolved" in result
+    assert bucket is not None
+    assert "resolution_suggested" not in bucket["metadata"]
+    entry = bucket["metadata"]["change_log"][-1]
+    assert entry["action"] == "status"
+    assert entry["from"] == "active"
+    assert entry["to"] == "resolved"
+    assert entry["by"] == "trace"
+    assert entry["ts"]
+
+
+@pytest.mark.asyncio
+async def test_trace_plan_patch_and_status_change_records_actor(trace_runtime):
+    manager = trace_runtime
+    bucket_id = await manager.create(
+        content="旧计划正文",
+        bucket_type="plan",
+        weight=0.7,
+    )
+    await manager.update(bucket_id, status="active", change_log=[])
+
+    result = await trace_core(
+        bucket_id,
+        old_str="旧计划",
+        new_str="新计划",
+        status="resolved",
+    )
+    bucket = await manager.get(bucket_id)
+
+    assert "content=已局部替换" in result
+    assert bucket is not None
+    assert bucket["content"] == "新计划正文"
+    status_entry, edit_entry = bucket["metadata"]["change_log"][-2:]
+    assert status_entry["action"] == "status"
+    assert status_entry["from"] == "active"
+    assert status_entry["to"] == "resolved"
+    assert status_entry["by"] == "llm"
+    assert status_entry["ts"]
+    assert edit_entry["action"] == "edit"
+    assert edit_entry["by"] == "llm"

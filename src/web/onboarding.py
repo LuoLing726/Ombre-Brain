@@ -22,8 +22,10 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from ombrebrain.security.deployment_profile import (
+    assess_mcp_network_safety,
     build_profile_patch,
     effective_configuration_report,
+    mcp_network_safety_issue,
     profile_catalog,
     validate_profile_patch,
 )
@@ -57,9 +59,22 @@ def _report(path: str, persisted: Mapping[str, Any]) -> dict[str, Any]:
         sh.config,
         persisted,
         environment=os.environ,
+        in_docker=sh.in_docker(),
         config_path=path,
         persistence=persistence,
     )
+
+
+def _network_check(patch: Mapping[str, Any]) -> tuple[dict[str, Any], list[str], list[str]]:
+    """让预检与保存共用同一网络安全门禁，避免只修前端被绕过。"""
+    decision = assess_mcp_network_safety(
+        patch,
+        environment=os.environ,
+        in_docker=sh.in_docker(),
+    )
+    issue = mcp_network_safety_issue(decision)
+    warnings = [str(decision["reason"])] if decision["override_active"] else []
+    return decision, ([issue] if issue else []), warnings
 
 
 def register(mcp: Any) -> None:
@@ -106,7 +121,15 @@ def register(mcp: Any) -> None:
             body = await sh._read_json_object(request)
             patch = build_profile_patch(body.get("profile"), body.get("options"))
             issues = validate_profile_patch(patch)
-            return JSONResponse({"ok": not issues, "issues": issues, "patch": patch})
+            network_security, network_issues, warnings = _network_check(patch)
+            issues.extend(network_issues)
+            return JSONResponse({
+                "ok": not issues,
+                "issues": issues,
+                "warnings": warnings,
+                "patch": patch,
+                "mcp_network_security": network_security,
+            })
         except (ValueError, TypeError) as exc:
             return JSONResponse({"ok": False, "error": str(exc), "issues": [str(exc)]}, status_code=400)
         except Exception as exc:
@@ -126,8 +149,14 @@ def register(mcp: Any) -> None:
                 return JSONResponse({"ok": False, "error": "confirm=true required"}, status_code=400)
             patch = build_profile_patch(body.get("profile"), body.get("options"))
             issues = validate_profile_patch(patch)
+            network_security, network_issues, warnings = _network_check(patch)
+            issues.extend(network_issues)
             if issues:
-                return JSONResponse({"ok": False, "issues": issues}, status_code=400)
+                return JSONResponse({
+                    "ok": False,
+                    "issues": issues,
+                    "mcp_network_security": network_security,
+                }, status_code=400)
             path = config_file_path()
             # 与 Dashboard 其余配置入口共用同一把读改写锁及 bind-mount
             # EBUSY 兼容路径。旧实现先读后 os.replace，不但会在 Docker
@@ -142,6 +171,8 @@ def register(mcp: Any) -> None:
                 "ok": True,
                 "saved": patch,
                 "report": report,
+                "warnings": warnings,
+                "mcp_network_security": network_security,
                 "restart_required": restart_required,
                 "message": (
                     "部署模式已保存，重启服务后生效。"

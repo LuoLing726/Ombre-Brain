@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from datetime import datetime
 import errno
 import hashlib
@@ -40,6 +41,38 @@ async def test_filesystem_turn_hashes_key_and_does_not_steal_aged_live_lease(
                 pytest.fail("a live kernel lease must not be stolen by file age")
 
     assert not (tmp_path / "outside").exists()
+
+
+@pytest.mark.asyncio
+async def test_content_turn_delegates_to_non_stealable_kernel_lease(
+    tmp_path,
+    monkeypatch,
+):
+    calls = []
+
+    @asynccontextmanager
+    async def observed_lease(base_dir, key, timeout_seconds=30.0):
+        calls.append((base_dir, key, timeout_seconds))
+        yield
+
+    monkeypatch.setattr(common, "_kernel_filesystem_turn", observed_lease)
+    monkeypatch.setattr(
+        rt,
+        "bucket_mgr",
+        MagicMock(base_dir=tmp_path / "vault"),
+    )
+    monkeypatch.setattr(rt, "config", {"dehydration": {"timeout_seconds": 120}})
+
+    async with common._filesystem_content_turn("same-content"):
+        pass
+
+    assert calls == [
+        (
+            str(tmp_path / "vault"),
+            "content-same-content",
+            common._CONTENT_LOCK_WAIT_MIN_SECONDS,
+        )
+    ]
 
 
 @pytest.mark.asyncio

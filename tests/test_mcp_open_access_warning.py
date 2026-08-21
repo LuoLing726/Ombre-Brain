@@ -26,5 +26,14 @@ def test_disabled_branch_uses_warning_not_info():
 
 def test_warning_mentions_risk_terms():
     win = _disabled_branch()
-    for term in ("读写", "记忆", "0.0.0.0"):
+    for term in ("读写", "记忆", "_BIND_HOST"):
         assert term in win, f"缺少风险措辞：{term}"
+
+
+def test_network_guard_runs_before_web_auth_routes_are_registered():
+    src = _SERVER.read_text(encoding="utf-8")
+    guard = src.index("_mcp_network_security = enforce_mcp_network_guard")
+    shared_init = src.index("_wsh.init(config)", guard)
+    route_registration = src.index("_web.register_all(mcp)", shared_init)
+
+    assert guard < shared_init < route_registration

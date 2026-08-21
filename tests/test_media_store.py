@@ -1,11 +1,13 @@
 """媒体持久化回归：临时来源必须复制进 OB 持久目录。"""
 
 import base64
+import os
 from pathlib import Path
 
 import pytest
 
 from ombrebrain.storage.media_store import MediaPersistenceError, MediaStore
+from ombrebrain.storage import media_store as media_store_mod
 
 
 @pytest.mark.asyncio
@@ -47,3 +49,106 @@ async def test_unreadable_client_temporary_path_is_rejected(tmp_path: Path) -> N
 
     with pytest.raises(MediaPersistenceError, match="data_base64"):
         await store.persist("bucket-3", "/client-only/temporary/photo.png")
+
+
+@pytest.mark.asyncio
+async def test_server_path_symlink_is_rejected(tmp_path: Path) -> None:
+    target = tmp_path / "target.png"
+    target.write_bytes(b"image-bytes")
+    link = tmp_path / "linked.png"
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"symlink creation is unavailable: {exc}")
+    store = MediaStore(str(tmp_path / "vault"), str(tmp_path / "vault" / "_media"))
+
+    with pytest.raises(MediaPersistenceError, match="符号链接"):
+        await store.persist("bucket-symlink", str(link))
+
+
+@pytest.mark.asyncio
+async def test_server_path_special_file_is_rejected(tmp_path: Path) -> None:
+    store = MediaStore(str(tmp_path / "vault"), str(tmp_path / "vault" / "_media"))
+
+    with pytest.raises(MediaPersistenceError, match="普通文件|data_base64"):
+        await store.persist("bucket-directory", str(tmp_path))
+
+
+@pytest.mark.asyncio
+async def test_server_path_over_limit_is_rejected(tmp_path: Path) -> None:
+    source = tmp_path / "oversized.bin"
+    source.write_bytes(b"12345")
+    store = MediaStore(
+        str(tmp_path / "vault"),
+        str(tmp_path / "vault" / "_media"),
+        max_bytes=4,
+    )
+
+    with pytest.raises(MediaPersistenceError, match="上限 4 字节"):
+        await store.persist("bucket-oversized", str(source))
+
+
+def test_server_path_read_is_bounded_to_max_plus_one(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "bounded.bin"
+    source.write_bytes(b"data")
+    store = MediaStore(
+        str(tmp_path / "vault"),
+        str(tmp_path / "vault" / "_media"),
+        max_bytes=8,
+    )
+    requested_sizes: list[int] = []
+    real_fdopen = os.fdopen
+
+    class TrackingReader:
+        def __init__(self, fd: int, mode: str) -> None:
+            self._handle = real_fdopen(fd, mode)
+
+        def __enter__(self):
+            self._handle.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._handle.__exit__(*args)
+
+        def read(self, size: int) -> bytes:
+            requested_sizes.append(size)
+            return self._handle.read(size)
+
+    monkeypatch.setattr(
+        media_store_mod.os,
+        "fdopen",
+        lambda fd, mode: TrackingReader(fd, mode),
+    )
+
+    data, name = store._read_path(str(source))
+
+    assert data == b"data"
+    assert name == source.name
+    assert requested_sizes == [store.max_bytes + 1]
+
+
+def test_server_path_replacement_after_open_is_rejected(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "raced.bin"
+    source.write_bytes(b"data")
+    store = MediaStore(str(tmp_path / "vault"), str(tmp_path / "vault" / "_media"))
+    real_lstat = os.lstat
+    calls = 0
+
+    def changed_lstat(path):
+        nonlocal calls
+        calls += 1
+        result = real_lstat(path)
+        if calls == 1:
+            return result
+        values = list(result)
+        values[1] = result.st_ino + 1
+        return os.stat_result(values)
+
+    monkeypatch.setattr(media_store_mod.os, "lstat", changed_lstat)
+
+    with pytest.raises(MediaPersistenceError, match="发生变化"):
+        store._read_path(str(source))

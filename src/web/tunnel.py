@@ -26,6 +26,8 @@ from typing import Optional
 from starlette.requests import Request
 from starlette.responses import Response
 
+from ombrebrain.security.deployment_profile import insecure_mcp_override_enabled
+
 from . import _shared as sh
 
 try:
@@ -72,8 +74,29 @@ def _tunnel_running() -> bool:
     return True
 
 
+def _tunnel_security_issue() -> str:
+    """内置隧道会把回环服务带到公网，免鉴权时必须单独阻断。"""
+    auth_required = parse_bool(
+        sh.config.get("mcp_require_auth", True), default=True
+    )
+    if auth_required or insecure_mcp_override_enabled(os.environ):
+        return ""
+    return (
+        "MCP 鉴权已关闭，不能启动公网 Tunnel。请先开启 OAuth/静态 Token；"
+        "仅在明确承担匿名公网读写风险时才设置 OMBRE_ALLOW_INSECURE_MCP=true。"
+    )
+
+
 def _start_tunnel(token: str) -> tuple[bool, str]:
     global _tunnel_proc, _tunnel_last_error
+    security_issue = _tunnel_security_issue()
+    if security_issue:
+        return False, security_issue
+    if not parse_bool(sh.config.get("mcp_require_auth", True), default=True):
+        sh.logger.critical(
+            "已通过 OMBRE_ALLOW_INSECURE_MCP=true 启动免鉴权公网 Tunnel；"
+            "任何能访问该地址的人都可读写全部记忆"
+        )
     if _tunnel_running():
         return True, "already running"
     cf = shutil.which("cloudflared")
@@ -141,7 +164,7 @@ def register(mcp) -> None:
             ),
             "mcp_auth_mode": (
                 str(sh.config.get("mcp_auth_mode", "oauth")).strip().lower()
-                if str(sh.config.get("mcp_auth_mode", "oauth")).strip().lower() in ("oauth", "token")
+                if str(sh.config.get("mcp_auth_mode", "oauth")).strip().lower() in ("oauth", "token", "hybrid")
                 else "oauth"
             ),
             "last_error": _tunnel_last_error if not running else "",
@@ -174,6 +197,10 @@ def register(mcp) -> None:
             except ValueError as e:
                 return JSONResponse({"error": str(e)}, status_code=400)
 
+        security_issue = _tunnel_security_issue()
+        if cfg.get("token") and cfg.get("auto_start") and security_issue:
+            return JSONResponse({"error": security_issue}, status_code=400)
+
         try:
             _save_tunnel_config(cfg)
             persisted = _load_tunnel_config()
@@ -198,6 +225,9 @@ def register(mcp) -> None:
         token = cfg.get("token", "").strip()
         if not token:
             return JSONResponse({"error": "未配置 Token，请先保存 Token"}, status_code=400)
+        security_issue = _tunnel_security_issue()
+        if security_issue:
+            return JSONResponse({"error": security_issue}, status_code=400)
         ok, msg = _start_tunnel(token)
         if not ok:
             return JSONResponse({"error": msg}, status_code=500)

@@ -11,9 +11,16 @@ _Send = Callable[[dict], Awaitable[None]]
 _REJECTION_DRAIN_MULTIPLIER = 2
 
 
+# 两个公开的 MCP 端点：
+#   /mcp        —— 主连接器，日常记忆动作
+#   /mcp-extra  —— 低频的独立语义层（信件）。2.8.5 起退役返回 404，3.2.0 恢复。
+# 中间件必须同时认这两个路径，否则 /mcp-extra 会绕过体积限制、CSRF 与鉴权。
+_MCP_ENDPOINT_PATHS = frozenset({"/mcp", "/mcp-extra"})
+
+
 def is_mcp_endpoint_path(path: object) -> bool:
-    """Match the one public MCP endpoint without accepting prefix lookalikes."""
-    return str(path or "").rstrip("/") == "/mcp"
+    """Match the public MCP endpoints without accepting prefix lookalikes."""
+    return str(path or "").rstrip("/") in _MCP_ENDPOINT_PATHS
 
 
 def is_sse_endpoint_path(path: object) -> bool:

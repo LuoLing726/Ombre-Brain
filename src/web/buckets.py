@@ -11,6 +11,9 @@ web/buckets.py — 记忆桶管理 + 设置 + 锚点 + 自我认知读取
 ========================================
 """
 
+import math
+import threading
+import unicodedata
 from contextlib import AsyncExitStack
 
 from starlette.requests import Request
@@ -40,18 +43,31 @@ try:
     from tools._common import (  # type: ignore
         _quota_turn,
         check_pinned_quota as _check_pinned_quota,
-        enforce_high_importance_quota as _enforce_high_importance_quota,
         is_terminal_memory_metadata as _is_terminal_memory_metadata,
-        occupies_high_importance_quota_slot as _occupies_high_importance_slot,
     )
 except ImportError:  # pragma: no cover
     from ..tools._common import (  # type: ignore
         _quota_turn,
         check_pinned_quota as _check_pinned_quota,
-        enforce_high_importance_quota as _enforce_high_importance_quota,
         is_terminal_memory_metadata as _is_terminal_memory_metadata,
-        occupies_high_importance_quota_slot as _occupies_high_importance_slot,
     )
+
+try:
+    from tools.plan.core import (  # type: ignore
+        is_letter_bucket,
+        letter_lock_state,
+        safe_letter_metadata,
+    )
+except ImportError:  # pragma: no cover
+    from ..tools.plan.core import (  # type: ignore
+        is_letter_bucket,
+        letter_lock_state,
+        safe_letter_metadata,
+    )
+
+
+_LOCKED_LETTER_NAME = "一封上锁的信"
+_LOCKED_LETTER_NOTICE = "这封信尚未向你开放。"
 
 
 def _datetime_epoch_ms(value) -> int | None:
@@ -85,6 +101,9 @@ async def rename_human_in_buckets(old: str, new: str) -> dict:
 
 
 def register(mcp) -> None:
+    # 每次路由注册使用一个原生提交锁，不与 asyncio 事件循环绑定；临界区内
+    # 不执行 await，因此既能跨测试事件循环串行化，也不会因持锁等待而死锁。
+    sampling_commit_lock = threading.Lock()
 
     @mcp.custom_route("/api/buckets", methods=["GET"])
     async def api_buckets(request: Request) -> Response:
@@ -105,19 +124,33 @@ def register(mcp) -> None:
             )
         try:
             all_buckets = await sh.bucket_mgr.list_all(include_archive=True)
+            deletion_statuses = (
+                sh.deletion_requests.status_snapshot()
+                if sh.deletion_requests is not None else {}
+            )
             result = []
             for b in all_buckets:
                 meta = b.get("metadata", {})
                 if meta.get("deleted_at"):
                     continue
+                lock_state = letter_lock_state(b, "human")
+                letter_locked = bool(lock_state["locked"])
                 created_epoch_ms = _datetime_epoch_ms(meta.get("created"))
                 last_active_epoch_ms = _datetime_epoch_ms(meta.get("last_active"))
                 result.append({
                     "id": b["id"],
-                    "name": meta.get("name", b["id"]),
+                    "name": (
+                        _LOCKED_LETTER_NAME
+                        if letter_locked
+                        else meta.get("name", b["id"])
+                    ),
                     "type": meta.get("type", "dynamic"),
-                    "domain": meta.get("domain", []),
-                    "tags": meta.get("tags", []),
+                    "domain": (
+                        ["letter"] if letter_locked else meta.get("domain", [])
+                    ),
+                    "tags": (
+                        ["__letter__"] if letter_locked else meta.get("tags", [])
+                    ),
                     "valence": meta.get("valence", 0.5),
                     "arousal": meta.get("arousal", 0.3),
                     "model_valence": meta.get("model_valence"),
@@ -125,23 +158,39 @@ def register(mcp) -> None:
                     "resolved": meta.get("resolved", False),
                     "pinned": meta.get("pinned", False),
                     "digested": meta.get("digested", False),
+                    "imported": parse_bool(meta.get("imported"), default=False)
+                    or str(meta.get("source_tool") or "").strip() == "import",
                     "created": meta.get("created", ""),
                     "created_epoch_ms": created_epoch_ms,
                     "last_active": meta.get("last_active", ""),
                     "last_active_epoch_ms": last_active_epoch_ms,
                     "activation_count": meta.get("activation_count", 0),
                     "score": sh.decay_engine.calculate_score(meta),
-                    "content_preview": strip_wikilinks(b.get("content", ""))[:200],
+                    "content_preview": (
+                        _LOCKED_LETTER_NOTICE
+                        if letter_locked
+                        else strip_wikilinks(b.get("content", ""))[:200]
+                    ),
+                    "letter_locked": letter_locked,
+                    "lock_type": lock_state["lock_type"],
+                    "unlock_date": lock_state["unlock_date"],
                     # iter 1.8 新增字段（后台老桶读出默认值）
-                    "why_remembered": meta.get("why_remembered", ""),
+                    "why_remembered": (
+                        "" if letter_locked else meta.get("why_remembered", "")
+                    ),
                     "dont_surface": bool(meta.get("dont_surface", False)),
                     "first_of_kind": bool(meta.get("first_of_kind", False)),
                     "weight": meta.get("weight"),  # plan 专有，非 plan 为 None
-                    "triggered_by": meta.get("triggered_by", ""),
+                    "triggered_by": (
+                        "" if letter_locked else meta.get("triggered_by", "")
+                    ),
                     "erasable_test_data": bool(
                         isinstance(meta.get("provenance"), dict)
                         and meta["provenance"].get("kind") == "test"
                         and meta["provenance"].get("erasable") is True
+                    ),
+                    "deletion_request": (
+                        deletion_statuses.get(str(b["id"]))
                     ),
                 })
             if sort_mode == "score":
@@ -179,6 +228,30 @@ def register(mcp) -> None:
         if not bucket:
             return JSONResponse({"error": "not found"}, status_code=404)
         meta = bucket.get("metadata", {})
+        lock_state = letter_lock_state(bucket, "human")
+        if lock_state["locked"]:
+            safe_letter = safe_letter_metadata(bucket, "human")
+            return JSONResponse({
+                "id": bucket["id"],
+                "metadata": {
+                    "name": _LOCKED_LETTER_NAME,
+                    "type": meta.get("type", "letter"),
+                    "domain": ["letter"],
+                    "author": safe_letter["author"],
+                    "user_name": safe_letter["user_name"],
+                    "writer_name": safe_letter["writer_name"],
+                    "letter_date": safe_letter["date"],
+                    "created": safe_letter["created"],
+                    "lock_type": safe_letter["lock_type"],
+                    "unlock_date": safe_letter["unlock_date"],
+                    "locked": True,
+                },
+                "content": "",
+                "display_content": _LOCKED_LETTER_NOTICE,
+                "score": sh.decay_engine.calculate_score(meta),
+                "triggered_feels": [],
+                "letter_locked": True,
+            })
         # iter 1.9 D / iter 2.0 §10 U-04: 反向链——只扫 feel_dir，O(feel桶数) 而非全库扫描
         triggered_feels = []
         try:
@@ -196,6 +269,11 @@ def register(mcp) -> None:
             "display_content": strip_wikilinks(raw_content),
             "score": sh.decay_engine.calculate_score(meta),
             "triggered_feels": triggered_feels,  # iter 1.9 D
+            "letter_locked": False,
+            "deletion_request": (
+                sh.deletion_requests.status(str(bucket["id"]))
+                if sh.deletion_requests is not None else None
+            ),
         })
 
 
@@ -220,6 +298,11 @@ def register(mcp) -> None:
                 if not bucket:
                     return JSONResponse({"error": "not found"}, status_code=404)
                 meta = bucket.get("metadata", {})
+                if is_letter_bucket(bucket):
+                    return JSONResponse(
+                        {"error": "letters cannot be pinned from the bucket API"},
+                        status_code=403,
+                    )
                 if _is_terminal_memory_metadata(meta):
                     return JSONResponse(
                         {"error": "archived buckets cannot be pinned or unpinned"},
@@ -228,43 +311,52 @@ def register(mcp) -> None:
                 current_pinned = parse_bool(meta.get("pinned"), default=False)
                 new_pinned = not current_pinned
                 protected = parse_bool(meta.get("protected"), default=False)
+                if protected and new_pinned:
+                    return JSONResponse(
+                        {
+                            "error": "protected 与 pinned 互斥；请先解除保护",
+                            "conflict": "pinned_protected_mutually_exclusive",
+                        },
+                        status_code=409,
+                    )
                 update_kwargs: dict[str, object] = {"pinned": new_pinned}
                 try:
                     current_importance = int(meta.get("importance") or 0)
                 except (TypeError, ValueError):
                     current_importance = 0
+                unpin_importance = current_importance
+                if current_pinned and not protected:
+                    try:
+                        body = await sh._read_json_object(request)
+                        raw_importance = body.get("importance")
+                        if isinstance(raw_importance, bool):
+                            raise ValueError("boolean is not an importance")
+                        unpin_importance = int(raw_importance)
+                        if (
+                            isinstance(raw_importance, float)
+                            and not raw_importance.is_integer()
+                        ):
+                            raise ValueError("fractional importance")
+                    except Exception:
+                        return JSONResponse(
+                            {
+                                "error": "unpin requires importance=1..10 in the same request",
+                                "field": "importance",
+                            },
+                            status_code=400,
+                        )
+                    if not 1 <= unpin_importance <= 10:
+                        return JSONResponse(
+                            {
+                                "error": "unpin requires importance=1..10 in the same request",
+                                "field": "importance",
+                            },
+                            status_code=400,
+                        )
+                    update_kwargs["importance"] = unpin_importance
                 current_type = str(
                     meta.get("type") or "dynamic"
                 ).strip().lower()
-                final_type = (
-                    "permanent"
-                    if new_pinned
-                    else "dynamic"
-                    if current_pinned and not protected
-                    else current_type
-                )
-                before_quota_meta = dict(meta)
-                before_quota_meta.update({
-                    "importance": current_importance,
-                    "pinned": current_pinned,
-                    "protected": protected,
-                    "type": current_type,
-                })
-                after_quota_meta = dict(before_quota_meta)
-                after_quota_meta.update({
-                    "importance": 10 if new_pinned else current_importance,
-                    "pinned": new_pinned,
-                    "type": final_type,
-                })
-                occupied_high_before = _occupies_high_importance_slot(
-                    before_quota_meta
-                )
-                occupies_high_after = _occupies_high_importance_slot(
-                    after_quota_meta
-                )
-                await quota_stack.enter_async_context(
-                    _quota_turn("high_importance")
-                )
 
                 locked_bucket = await sh.bucket_mgr.get(bucket_id)
                 if not locked_bucket:
@@ -272,6 +364,11 @@ def register(mcp) -> None:
                 locked_meta = locked_bucket.get("metadata", {})
                 if not isinstance(locked_meta, dict):
                     locked_meta = {}
+                if is_letter_bucket(locked_bucket):
+                    return JSONResponse(
+                        {"error": "letter state changed concurrently"},
+                        status_code=409,
+                    )
                 if _is_terminal_memory_metadata(locked_meta):
                     return JSONResponse(
                         {"error": "bucket was archived concurrently"},
@@ -312,19 +409,12 @@ def register(mcp) -> None:
                     quota_err = await _check_pinned_quota()
                     if quota_err:
                         return JSONResponse({"error": quota_err}, status_code=400)
-                else:
-                    # A formerly pinned importance=10 bucket becomes an
-                    # ordinary high-importance bucket after unpinning.  Reserve
-                    # that quota atomically too; when full, demote to 8 in the
-                    # same BucketManager transaction.
-                    if occupies_high_after and not occupied_high_before:
-                        adjusted_importance = (
-                            await _enforce_high_importance_quota(current_importance)
-                        )
-                        if adjusted_importance != current_importance:
-                            update_kwargs["importance"] = adjusted_importance
 
-                ok = await sh.bucket_mgr.update(bucket_id, **update_kwargs)
+                ok = await sh.bucket_mgr.update(
+                    bucket_id,
+                    event_actor="human",
+                    **update_kwargs,
+                )
                 if not ok:
                     latest = await sh.bucket_mgr.get(bucket_id)
                     if _is_terminal_memory_metadata(
@@ -385,17 +475,31 @@ def register(mcp) -> None:
 
     @mcp.custom_route("/api/bucket/{bucket_id}/archive", methods=["POST"])
     async def api_bucket_archive(request: Request) -> Response:
-        """Move bucket to archive directory (soft delete)."""
+        """Submit the single human archive request for a formal bucket.
+
+        Human-facing archive intentionally uses the delete-to-archive terminal
+        action: after AI approval the Markdown is retained in ``archive/`` and
+        receives ``deleted_at``. The lower-level ``bucket_mgr.archive()`` path
+        remains available to AI/system lifecycle code and keeps its distinct
+        non-tombstone semantics.
+        """
         from starlette.responses import JSONResponse
         err = sh._require_auth(request)
         if err:
             return err
         bucket_id = request.path_params["bucket_id"]
         try:
-            ok = await sh.bucket_mgr.archive(bucket_id)
-            if not ok:
-                return JSONResponse({"error": "archive failed or bucket not found"}, status_code=404)
-            return JSONResponse({"ok": True, "archived": True})
+            try:
+                body = await sh._read_json_object(request)
+            except Exception:
+                body = {}
+            result = await sh.deletion_requests.submit(
+                bucket_id, body.get("reason", ""), action="delete"
+            )
+            if result.get("ok"):
+                return JSONResponse(result)
+            status = 404 if result.get("code") == "not_found" else 409 if result.get("code") in {"pending_exists", "daily_limit", "lifetime_limit"} else 400
+            return JSONResponse(result, status_code=status)
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -414,47 +518,20 @@ def register(mcp) -> None:
             return err
         bucket_id = request.path_params["bucket_id"]
         try:
-            async with _quota_turn("high_importance"):
-                bucket = await sh.bucket_mgr.get(bucket_id)
-                if not bucket:
-                    return JSONResponse({"error": "not found"}, status_code=404)
-                metadata = bucket.get("metadata", {})
-                if not isinstance(metadata, dict):
-                    metadata = {}
-                current = parse_bool(
-                    metadata.get("dont_surface"), default=False
-                )
-                new_val = not current
-                projected = dict(metadata)
-                projected["dont_surface"] = new_val
-                update_kwargs: dict[str, object] = {"dont_surface": new_val}
-                quota_adjustment = None
-                if (
-                    _occupies_high_importance_slot(projected)
-                    and not _occupies_high_importance_slot(metadata)
-                ):
-                    try:
-                        requested_importance = int(
-                            metadata.get("importance") or 0
-                        )
-                    except (TypeError, ValueError):
-                        requested_importance = 0
-                    applied_importance = await _enforce_high_importance_quota(
-                        requested_importance
-                    )
-                    if applied_importance != requested_importance:
-                        update_kwargs["importance"] = applied_importance
-                        quota_adjustment = {
-                            "requested": requested_importance,
-                            "applied": applied_importance,
-                        }
-                ok = await sh.bucket_mgr.update(bucket_id, **update_kwargs)
-                if not ok:
-                    return JSONResponse({"error": "update failed"}, status_code=500)
-                payload = {"ok": True, "dont_surface": new_val}
-                if quota_adjustment:
-                    payload["quota_adjustment"] = quota_adjustment
-                return JSONResponse(payload)
+            bucket = await sh.bucket_mgr.get(bucket_id)
+            if not bucket:
+                return JSONResponse({"error": "not found"}, status_code=404)
+            metadata = bucket.get("metadata", {})
+            if not isinstance(metadata, dict):
+                metadata = {}
+            current = parse_bool(
+                metadata.get("dont_surface"), default=False
+            )
+            new_val = not current
+            ok = await sh.bucket_mgr.update(bucket_id, dont_surface=new_val)
+            if not ok:
+                return JSONResponse({"error": "update failed"}, status_code=500)
+            return JSONResponse({"ok": True, "dont_surface": new_val})
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -486,53 +563,21 @@ def register(mcp) -> None:
             target = parse_bool(body["dont_surface"])
         except ValueError as e:
             return JSONResponse({"error": str(e)}, status_code=400)
-        ok_ids, missing_ids, errors, quota_adjustments = [], [], [], []
-        async with _quota_turn("high_importance"):
-            for bid in dict.fromkeys(ids):
-                try:
-                    b = await sh.bucket_mgr.get(bid)
-                    if not b:
-                        missing_ids.append(bid)
-                        continue
-                    metadata = b.get("metadata", {})
-                    if not isinstance(metadata, dict):
-                        metadata = {}
-                    projected = dict(metadata)
-                    projected["dont_surface"] = target
-                    update_kwargs: dict[str, object] = {"dont_surface": target}
-                    quota_adjustment = None
-                    if (
-                        _occupies_high_importance_slot(projected)
-                        and not _occupies_high_importance_slot(metadata)
-                    ):
-                        try:
-                            requested_importance = int(
-                                metadata.get("importance") or 0
-                            )
-                        except (TypeError, ValueError):
-                            requested_importance = 0
-                        applied_importance = (
-                            await _enforce_high_importance_quota(
-                                requested_importance
-                            )
-                        )
-                        if applied_importance != requested_importance:
-                            update_kwargs["importance"] = applied_importance
-                            quota_adjustment = {
-                                "id": bid,
-                                "requested": requested_importance,
-                                "applied": applied_importance,
-                            }
-                    ok = await sh.bucket_mgr.update(bid, **update_kwargs)
-                    if ok:
-                        ok_ids.append(bid)
-                        if quota_adjustment:
-                            quota_adjustments.append(quota_adjustment)
-                    else:
-                        errors.append({"id": bid, "error": "update failed"})
-                except Exception as e:
-                    errors.append({"id": bid, "error": str(e)})
-                    logger.warning(f"batch forget failed for {bid}: {e}")
+        ok_ids, missing_ids, errors = [], [], []
+        for bid in dict.fromkeys(ids):
+            try:
+                b = await sh.bucket_mgr.get(bid)
+                if not b:
+                    missing_ids.append(bid)
+                    continue
+                ok = await sh.bucket_mgr.update(bid, dont_surface=target)
+                if ok:
+                    ok_ids.append(bid)
+                else:
+                    errors.append({"id": bid, "error": "update failed"})
+            except Exception as e:
+                errors.append({"id": bid, "error": str(e)})
+                logger.warning(f"batch forget failed for {bid}: {e}")
         payload = {
             "ok": not errors,
             "dont_surface": target,
@@ -540,8 +585,6 @@ def register(mcp) -> None:
             "missing": missing_ids,
             "errors": errors,
         }
-        if quota_adjustments:
-            payload["quota_adjustments"] = quota_adjustments
         return JSONResponse(payload)
 
     @mcp.custom_route("/api/buckets/batch", methods=["POST"])
@@ -563,6 +606,12 @@ def register(mcp) -> None:
             return JSONResponse({"error": "invalid bucket id"}, status_code=400)
         if action not in {"forget", "resolve", "archive"}:
             return JSONResponse({"error": "unsupported batch action"}, status_code=400)
+        if action == "archive":
+            result = await sh.deletion_requests.submit_batch(
+                list(dict.fromkeys(ids)), body.get("reason", ""), action="delete"
+            )
+            status = 400 if result.get("code") == "reason_required" else 200
+            return JSONResponse({"action": action, **result}, status_code=status)
         updated, missing, errors = [], [], []
         for bucket_id in dict.fromkeys(ids):
             try:
@@ -574,8 +623,6 @@ def register(mcp) -> None:
                     ok = await sh.bucket_mgr.update(bucket_id, dont_surface=True)
                 elif action == "resolve":
                     ok = await sh.bucket_mgr.update(bucket_id, resolved=True)
-                else:
-                    ok = await sh.bucket_mgr.archive(bucket_id)
                 if ok:
                     updated.append(bucket_id)
                 else:
@@ -630,8 +677,12 @@ def register(mcp) -> None:
         err = sh._require_auth(request)
         if err:
             return err
-        surfacing = sh.config.setdefault("surfacing", {})
-        sampling = surfacing.setdefault("sampling", {})
+        surfacing = sh.config.get("surfacing")
+        if not isinstance(surfacing, dict):
+            surfacing = {}
+        sampling = surfacing.get("sampling")
+        if not isinstance(sampling, dict):
+            sampling = {}
         if request.method == "GET":
             return JSONResponse({
                 "enabled": parse_bool(sampling.get("enabled", False), default=False),
@@ -643,52 +694,105 @@ def register(mcp) -> None:
             body = await sh._read_json_object(request)
         except Exception:
             return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-        # Validate ranges; reject silently-corrupt inputs at the boundary
-        try:
-            if "enabled" in body:
-                sampling["enabled"] = parse_bool(body["enabled"])
-            if "top_k" in body:
-                tk = int(body["top_k"])
-                if not (1 <= tk <= 50):
-                    return JSONResponse({"error": "top_k must be in [1,50]"}, status_code=400)
-                sampling["top_k"] = tk
-            if "sample_k" in body:
-                sk = int(body["sample_k"])
-                if not (1 <= sk <= 20):
-                    return JSONResponse({"error": "sample_k must be in [1,20]"}, status_code=400)
-                sampling["sample_k"] = sk
-            if "temperature" in body:
-                t = float(body["temperature"])
-                if not (0.1 <= t <= 5.0):
-                    return JSONResponse({"error": "temperature must be in [0.1,5.0]"}, status_code=400)
-                sampling["temperature"] = t
-        except (ValueError, TypeError) as e:
-            return JSONResponse({"error": f"invalid field type: {e}"}, status_code=400)
+        # JSON 读取已经结束，以下原生锁临界区内没有 await。锁覆盖候选快照、
+        # 落盘和运行态发布，防止并发更新丢字段或出现磁盘/运行态逆序。
+        with sampling_commit_lock:
+            live_surfacing = sh.config.get("surfacing")
+            if not isinstance(live_surfacing, dict):
+                live_surfacing = {}
+            live_sampling = live_surfacing.get("sampling")
+            if not isinstance(live_sampling, dict):
+                live_sampling = {}
 
-        # --- 写回 config.yaml（iter 2.0 §10 U-03 修复：重启后设置不丢失）---
-        def _mutate_sampling(save_config: dict) -> None:
-            sf = save_config.setdefault("surfacing", {})
-            if not isinstance(sf, dict):
-                sf = {}
-                save_config["surfacing"] = sf
-            samp = sf.setdefault("sampling", {})
-            if not isinstance(samp, dict):
-                samp = {}
-                sf["sampling"] = samp
-            samp.update({
-                "enabled": sampling.get("enabled", False),
-                "top_k": sampling.get("top_k", 5),
-                "sample_k": sampling.get("sample_k", 2),
-                "temperature": sampling.get("temperature", 0.7),
-            })
-        try:
-            atomic_update_config_yaml(_mutate_sampling)
-        except Exception as e:
-            # 之前这里只 logger.warning、仍回 ok:True——用户看到"已保存"，
-            # 磁盘其实没落地，下次重启（崩溃/热更新）设置又变回旧值。如实报错。
-            return JSONResponse({"error": f"采样设置写入磁盘失败，未保存：{e}"}, status_code=500)
+            # 先在独立候选副本上完成全部校验。若逐字段发布，后续字段无效或
+            # config.yaml 写入失败时，运行态会残留一半新、一半旧的配置。
+            candidate = dict(live_sampling)
+            try:
+                if "enabled" in body:
+                    candidate["enabled"] = parse_bool(body["enabled"])
+                if "top_k" in body:
+                    if isinstance(body["top_k"], bool):
+                        raise ValueError("top_k must be an integer")
+                    tk = int(body["top_k"])
+                    if isinstance(body["top_k"], float) and body["top_k"] != tk:
+                        raise ValueError("top_k must be an integer")
+                    if not (1 <= tk <= 50):
+                        return JSONResponse(
+                            {"error": "top_k must be in [1,50]"}, status_code=400
+                        )
+                    candidate["top_k"] = tk
+                if "sample_k" in body:
+                    if isinstance(body["sample_k"], bool):
+                        raise ValueError("sample_k must be an integer")
+                    sk = int(body["sample_k"])
+                    if (
+                        isinstance(body["sample_k"], float)
+                        and body["sample_k"] != sk
+                    ):
+                        raise ValueError("sample_k must be an integer")
+                    if not (1 <= sk <= 20):
+                        return JSONResponse(
+                            {"error": "sample_k must be in [1,20]"},
+                            status_code=400,
+                        )
+                    candidate["sample_k"] = sk
+                if "temperature" in body:
+                    if isinstance(body["temperature"], bool):
+                        raise ValueError("temperature must be a number")
+                    temperature = float(body["temperature"])
+                    if not math.isfinite(temperature) or not (
+                        0.1 <= temperature <= 5.0
+                    ):
+                        return JSONResponse(
+                            {"error": "temperature must be in [0.1,5.0]"},
+                            status_code=400,
+                        )
+                    candidate["temperature"] = temperature
+            except (OverflowError, ValueError, TypeError) as e:
+                return JSONResponse(
+                    {"error": f"invalid field type: {e}"}, status_code=400
+                )
 
-        return JSONResponse({"ok": True, **sampling})
+            # 写回 config.yaml，保证重启后设置不丢失。
+            def _mutate_sampling(save_config: dict) -> None:
+                sf = save_config.setdefault("surfacing", {})
+                if not isinstance(sf, dict):
+                    sf = {}
+                    save_config["surfacing"] = sf
+                samp = sf.setdefault("sampling", {})
+                if not isinstance(samp, dict):
+                    samp = {}
+                    sf["sampling"] = samp
+                samp.update({
+                    "enabled": candidate.get("enabled", False),
+                    "top_k": candidate.get("top_k", 5),
+                    "sample_k": candidate.get("sample_k", 2),
+                    "temperature": candidate.get("temperature", 0.7),
+                })
+
+            try:
+                atomic_update_config_yaml(_mutate_sampling)
+            except Exception as e:
+                # 磁盘未落地就如实报错，不能让用户看到“已保存”。
+                return JSONResponse(
+                    {"error": f"采样设置写入磁盘失败，未保存：{e}"},
+                    status_code=500,
+                )
+
+            # 以磁盘写入成功为提交点；尽量保留原嵌套字典对象，因为浮现逻辑
+            # 可能持有这个对象的引用。
+            published_surfacing = sh.config.get("surfacing")
+            if not isinstance(published_surfacing, dict):
+                published_surfacing = {}
+                sh.config["surfacing"] = published_surfacing
+            published_sampling = published_surfacing.get("sampling")
+            if not isinstance(published_sampling, dict):
+                published_sampling = {}
+                published_surfacing["sampling"] = published_sampling
+            published_sampling.clear()
+            published_sampling.update(candidate)
+
+            return JSONResponse({"ok": True, **published_sampling})
 
 
     # ---- iter 2.0: /api/settings/human — 读写通知称呼（human 宏）----
@@ -714,6 +818,11 @@ def register(mcp) -> None:
             human = "人类"
         if len(human) > 20:
             return JSONResponse({"error": "human name must be ≤ 20 characters"}, status_code=400)
+        if any(unicodedata.category(char).startswith("C") for char in human):
+            return JSONResponse(
+                {"error": "human name must not contain control characters"},
+                status_code=400,
+            )
         # Config read/write, live runtime update and the full-vault replacement
         # are one outer transaction.  Without it, concurrent A->B and B->C
         # requests can interleave their per-bucket writes and leave mixed names.
@@ -799,15 +908,30 @@ def register(mcp) -> None:
         items = []
         for b in anchors:
             m = b.get("metadata", {})
+            lock_state = letter_lock_state(b, "human")
+            letter_locked = bool(lock_state["locked"])
             items.append({
                 "id": b["id"],
-                "name": m.get("name") or b["id"],
+                "name": (
+                    _LOCKED_LETTER_NAME
+                    if letter_locked
+                    else m.get("name") or b["id"]
+                ),
                 "created": m.get("created", ""),
-                "domain": m.get("domain", []),
-                "tags": m.get("tags", []),
+                "domain": (
+                    ["letter"] if letter_locked else m.get("domain", [])
+                ),
+                "tags": (
+                    ["__letter__"] if letter_locked else m.get("tags", [])
+                ),
                 "type": m.get("type", "dynamic"),
                 "pinned": bool(m.get("pinned", False)),
-                "preview": (b.get("content", "") or "")[:80],
+                "preview": (
+                    _LOCKED_LETTER_NOTICE
+                    if letter_locked
+                    else (b.get("content", "") or "")[:80]
+                ),
+                "letter_locked": letter_locked,
             })
         return JSONResponse({
             "ok": True,
@@ -852,7 +976,7 @@ def register(mcp) -> None:
 
     @mcp.custom_route("/api/bucket/{bucket_id}", methods=["DELETE"])
     async def api_bucket_delete(request: Request) -> Response:
-        """Delete to archive (F-10): requires ?confirm=true. Moves file to archive/ + stamps deleted_at."""
+        """Submit a human deletion request for a formal bucket."""
         from starlette.responses import JSONResponse
         err = sh._require_auth(request)
         if err:
@@ -861,12 +985,26 @@ def register(mcp) -> None:
             return JSONResponse({"error": "confirm=true required for delete-to-archive"}, status_code=400)
         bucket_id = request.path_params["bucket_id"]
         try:
-            ok = await sh.bucket_mgr.delete(bucket_id)
-            if not ok:
-                return JSONResponse({"error": "bucket not found"}, status_code=404)
-            return JSONResponse({"ok": True, "deleted": True})
+            try:
+                body = await sh._read_json_object(request)
+            except Exception:
+                body = {}
+            result = await sh.deletion_requests.submit(bucket_id, body.get("reason", ""))
+            if result.get("ok"):
+                return JSONResponse(result)
+            status = 404 if result.get("code") == "not_found" else 409 if result.get("code") in {"pending_exists", "daily_limit", "lifetime_limit"} else 400
+            return JSONResponse(result, status_code=status)
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
+
+    @mcp.custom_route("/api/bucket/{bucket_id}/deletion-request/withdraw", methods=["POST"])
+    async def api_bucket_delete_withdraw(request: Request) -> Response:
+        from starlette.responses import JSONResponse
+        err = sh._require_auth(request)
+        if err:
+            return err
+        result = await sh.deletion_requests.withdraw(request.path_params["bucket_id"])
+        return JSONResponse(result, status_code=200 if result.get("ok") else 409)
 
 
     @mcp.custom_route("/api/buckets/purge", methods=["POST"])
@@ -903,8 +1041,11 @@ def register(mcp) -> None:
             all_b = await sh.bucket_mgr.list_all(include_archive=False)
             self_buckets = [
                 b for b in all_b
-                if b["metadata"].get("type") == "i"
-                or "__i__" in (b["metadata"].get("tags") or [])
+                if not is_letter_bucket(b)
+                and (
+                    b["metadata"].get("type") == "i"
+                    or "__i__" in (b["metadata"].get("tags") or [])
+                )
             ]
             self_buckets.sort(key=lambda b: b["metadata"].get("created", ""), reverse=True)
             result = []

@@ -15,6 +15,7 @@ import hashlib
 import mimetypes
 import os
 import re
+import stat
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -83,17 +84,67 @@ class MediaStore:
 
     def _read_path(self, raw_path: str) -> tuple[bytes, str]:
         source = Path(raw_path).expanduser()
-        if not source.is_file():
+        try:
+            before_open = os.lstat(source)
+        except OSError as exc:
             raise MediaPersistenceError(
                 f"媒体临时路径在 OB 服务器上不可读：{raw_path}。"
                 "请改传 data_base64，不能把客户端临时路径直接写进记忆。"
-            )
-        size = source.stat().st_size
-        if size > self.max_bytes:
+            ) from exc
+        if stat.S_ISLNK(before_open.st_mode):
             raise MediaPersistenceError(
-                f"媒体文件超过单项上限 {self.max_bytes} 字节：{raw_path}"
+                f"媒体路径必须是普通文件，不能是符号链接：{raw_path}"
             )
-        return source.read_bytes(), source.name
+        if not stat.S_ISREG(before_open.st_mode):
+            raise MediaPersistenceError(
+                f"媒体路径必须是普通文件：{raw_path}"
+            )
+
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd: int | None = None
+        try:
+            fd = os.open(source, flags)
+            opened = os.fstat(fd)
+            if not stat.S_ISREG(opened.st_mode):
+                raise MediaPersistenceError(
+                    f"媒体路径必须是普通文件：{raw_path}"
+                )
+
+            # 以已打开的文件描述符为读取真源。打开后再比较路径身份，
+            # 可在不二次按路径读取的前提下检出并发替换。
+            after_open = os.lstat(source)
+            if stat.S_ISLNK(after_open.st_mode) or (
+                after_open.st_dev,
+                after_open.st_ino,
+            ) != (opened.st_dev, opened.st_ino):
+                raise MediaPersistenceError(
+                    f"媒体路径在打开期间发生变化：{raw_path}"
+                )
+            if opened.st_size > self.max_bytes:
+                raise MediaPersistenceError(
+                    f"媒体文件超过单项上限 {self.max_bytes} 字节：{raw_path}"
+                )
+
+            with os.fdopen(fd, "rb") as handle:
+                fd = None
+                data = handle.read(self.max_bytes + 1)
+            if len(data) > self.max_bytes:
+                raise MediaPersistenceError(
+                    f"媒体文件超过单项上限 {self.max_bytes} 字节：{raw_path}"
+                )
+            return data, source.name
+        except MediaPersistenceError:
+            raise
+        except OSError as exc:
+            raise MediaPersistenceError(
+                f"媒体临时路径在 OB 服务器上不可读：{raw_path}。"
+                "请改传 data_base64，不能把客户端临时路径直接写进记忆。"
+            ) from exc
+        finally:
+            if fd is not None:
+                os.close(fd)
 
     def _decode_base64(self, value: str) -> bytes:
         payload = value.strip()

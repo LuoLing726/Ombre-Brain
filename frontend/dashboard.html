@@ -390,6 +390,34 @@
     overflow-y: auto;
     box-shadow: inset 3px 3px 6px var(--shadow-dark-subtle), inset -3px -3px 6px var(--shadow-light);
   }
+  .meaning-block {
+    margin: 8px 0 16px;
+    padding: 10px 14px;
+    border-left: 3px solid var(--accent);
+    background: var(--surface-solid);
+    color: var(--accent);
+    font-family: 'Cormorant Garamond', 'Noto Serif SC', serif;
+    line-height: 1.7;
+  }
+  .meaning-block-label {
+    margin-bottom: 5px;
+    color: var(--text-dim);
+    font-family: 'Share Tech Mono', 'Noto Sans SC', sans-serif;
+    font-size: 10px;
+    font-style: normal;
+    letter-spacing: 0.4px;
+  }
+  .meaning-quote {
+    margin: 0;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    font-style: italic;
+  }
+  .meaning-quote + .meaning-quote {
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+  }
 
   .config-section {
     margin-bottom: 28px;
@@ -1401,9 +1429,9 @@
   }
   .embed-warn-btn:hover { background: rgba(184,151,98,0.18); }
 
-  /* ====== P1 常驻系统状态条 / persistent system status bar ====== */
+  /* ====== P1 常驻系统状态条 ====== */
   #status-banner {
-    position: sticky; top: 56px; z-index: 40;
+    position: sticky; top: var(--ob-header-height, 96px); z-index: 40;
     font-size: 12.5px; color: var(--text);
     background: rgba(253,252,240,0.85); backdrop-filter: blur(6px);
     border-bottom: 1px solid var(--border);
@@ -1804,6 +1832,112 @@
     transition: opacity 0.3s;
   }
   .self-overlay.show { opacity: 1; pointer-events: auto; }
+
+  /* 多人模式名称来自环境变量；极长名称只能省略，不能反向撑宽页头。 */
+  #owner-badge {
+    min-width: 0;
+    max-width: min(220px, 100%);
+  }
+  #owner-badge-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* PC 窄窗：页头分为信息、操作两行，避免统计与标题被挤成竖排。 */
+  @media (min-width: 769px) and (max-width: 1500px) {
+    .header {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      grid-template-areas:
+        "title meta meta"
+        "search search actions";
+      align-items: center;
+      gap: 12px 16px;
+      padding: 20px 24px 16px;
+    }
+    .header h1 {
+      grid-area: title;
+      min-width: max-content;
+      white-space: nowrap;
+    }
+    .header-meta {
+      grid-area: meta;
+      min-width: 0;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+    }
+    .header .stats { white-space: nowrap; }
+    .search-bar {
+      grid-area: search;
+      width: 100%;
+      max-width: 720px;
+      min-width: 0;
+      margin-left: 0;
+    }
+    .search-bar input {
+      width: auto;
+      min-width: 0;
+      flex: 1;
+    }
+    .header-actions {
+      grid-area: actions;
+      margin-left: 0;
+      flex-shrink: 0;
+    }
+    .tabs {
+      display: grid;
+      grid-template-columns: repeat(11, minmax(0, 1fr));
+      margin: 12px 24px 8px;
+    }
+    .tab {
+      min-width: 0;
+      max-width: none;
+      padding: 9px 10px 7px;
+    }
+    .tab-spacer { display: none; }
+  }
+
+  /* 更窄的 PC 窗口将入口稳定排成 6 + 5，避免“关于”独占一行。 */
+  @media (min-width: 769px) and (max-width: 1100px) {
+    .tabs { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+  }
+
+  /* 移动端覆盖必须位于主题层之后，确保紧凑尺寸不会被桌面主题反向覆盖。 */
+  @media (max-width: 768px) {
+    .header h1 {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .header .stats {
+      white-space: normal;
+      word-break: keep-all;
+    }
+    .header-actions button {
+      width: 36px !important;
+      min-width: 36px !important;
+      height: 32px !important;
+      padding: 0 !important;
+      gap: 3px !important;
+      justify-content: center;
+      font-size: 0 !important;
+    }
+    .tabs {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      margin: 8px 12px;
+      padding: 6px 8px;
+      gap: 5px;
+    }
+    .tab {
+      min-width: 0;
+      max-width: none;
+      padding: 7px 10px 5px;
+    }
+    .tab-spacer { display: none; }
+  }
 </style>
 </head>
 <body>
@@ -2036,7 +2170,7 @@
       <div style="display:flex;gap:16px;margin-top:8px;font-size:13px;color:var(--text-dim);">
         <span>API调用 Calls: <b id="import-api-calls">0</b></span>
         <span>新建 New: <b id="import-created">0</b></span>
-        <span>合并 Merged: <b id="import-merged">0</b></span>
+        <span>精确去重 Skipped: <b id="import-skipped">0</b></span>
         <span>原文 Raw: <b id="import-raw">0</b></span>
       </div>
       <div style="margin-top:12px;">
@@ -2044,11 +2178,15 @@
       </div>
     </div>
 
-    <div id="import-errors" style="display:none;margin:12px 0;padding:12px;background:var(--surface);border-radius:8px;font-size:12px;color:var(--negative);max-height:120px;overflow-y:auto;"></div>
+    <div id="import-errors" style="display:none;margin:12px 0;padding:14px;background:rgba(190,90,65,.07);border:1px solid rgba(190,90,65,.35);border-radius:12px;font-size:12px;">
+      <div style="display:flex;align-items:center;gap:7px;color:var(--negative);font-weight:700;margin-bottom:10px;"><i data-lucide="circle-alert" style="width:16px;height:16px;"></i> 导入报错提醒 <span class="en">Import diagnostics</span></div>
+      <div id="import-error-list" style="display:flex;flex-direction:column;gap:9px;"></div>
+    </div>
 
     <div id="import-results-section" style="margin:20px 0;">
       <h3>已导入记忆 <span class="en">Imported</span> <button onclick="loadImportResults()" title="刷新 / Refresh" style="font-size:12px;padding:2px 8px;"><i data-lucide="refresh-cw"></i></button></h3>
       <div id="import-results-list" style="max-height:500px;overflow-y:auto;"></div>
+      <button id="import-results-more" type="button" onclick="loadMoreImportResults()" style="display:none;margin:10px auto 0;">加载更多 / Load more</button>
     </div>
 
     <hr style="border-color:var(--border);margin:24px 0;" />
@@ -2202,6 +2340,15 @@
         <label>标题 <span class="en">Title</span></label>
         <input type="text" id="letter-title" placeholder="标题（可选）/ Title (optional)" />
       </div>
+      <div class="config-row">
+        <label>可见时间 <span class="en">Lock</span></label>
+        <select id="letter-lock-type" onchange="toggleLetterUnlockInput()" style="flex:0 0 180px;">
+          <option value="none">立即可读</option>
+          <option value="timed">定时解锁</option>
+          <option value="permanent">永久锁</option>
+        </select>
+        <input type="datetime-local" id="letter-unlock-date" style="display:none;flex:0 0 240px;" />
+      </div>
       <div class="config-row" style="align-items:flex-start;">
         <label style="padding-top:10px;">正文 <span class="en">Body</span></label>
         <textarea id="letter-content" placeholder="…" style="flex:1;background:var(--bg);border:1px solid var(--border);color:var(--text);padding:12px 14px;border-radius:2px;font-family:inherit;font-size:13px;line-height:1.7;min-height:180px;resize:vertical;box-shadow:inset 2px 2px 4px var(--shadow-dark-subtle), inset -2px -2px 4px var(--shadow-light);"></textarea>
@@ -2308,6 +2455,16 @@
           </span>
           <!-- 热更新持久性提示（用户反馈 #1）：Docker 下如实说明「已持久化 / 重建后会失效」 -->
           <div id="ver-persist-note" style="display:none;margin-top:10px;font-size:12px;line-height:1.5;border-radius:8px;padding:9px 12px;"></div>
+          <!-- 依赖变化时是否自动 pip install（安全加固 #2 默认关闭；这里只是把已有的
+               config.update.allow_pip_install 暴露成可点的开关，不改默认值）。 -->
+          <div style="margin-top:10px;font-size:11px;color:var(--text-dim);line-height:1.6;">
+            <label style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;color:var(--text);">
+              <input type="checkbox" id="update-allow-pip" onchange="toggleUpdateAllowPip(this.checked)" />
+              热更新遇到依赖变化时自动安装（<code>pip install</code>）
+            </label>
+            <div style="margin-top:2px;">默认关闭：自动装依赖会把"谁能点热更新"放大成任意 PyPI 包的执行面。只在你信任更新来源、又不想每次依赖变化都手动重建镜像时打开；关闭时遇到依赖变化会直接拒绝更新，不改动任何文件。</div>
+            <div id="update-allow-pip-msg" style="min-height:14px;margin-top:2px;"></div>
+          </div>
         </div>
 
         <!-- 更新进度日志 -->
@@ -2722,10 +2879,22 @@
         <div style="margin-top:-4px;padding-left:122px;font-size:11px;color:var(--text-light);">0-100，越高越难合并相似桶</div>
         <div class="config-row"><label>breath 默认桶数</label><input type="number" id="cfg-sf-breath-results" min="1" max="50" /></div>
         <div style="margin-top:-4px;padding-left:122px;font-size:11px;color:var(--text-light);">1-50。AI 调用 breath() 不指定 max_results 时使用此默认值</div>
-        <div class="config-row"><label>breath 默认 token</label><input type="number" id="cfg-sf-breath-tokens" min="500" max="20000" step="500" /></div>
-        <div style="margin-top:-4px;padding-left:122px;font-size:11px;color:var(--text-light);">500-20000。breath 单次返回总 token 上限</div>
+        <div class="config-row"><label>breath 默认 token</label><input type="number" id="cfg-sf-breath-tokens" min="500" max="40000" step="500" /></div>
+        <div style="margin-top:-4px;padding-left:122px;font-size:11px;color:var(--text-light);">500-40000。breath 单次返回总 token 上限；40000 为安全上限，不是默认值</div>
         <div class="config-row"><label>feel 历史 token</label><input type="number" id="cfg-sf-feel-tokens" min="500" max="20000" step="500" /></div>
         <div style="margin-top:-4px;padding-left:122px;font-size:11px;color:var(--text-light);">500-20000。dream / breath(domain=feel) 中新 feel 的全文预算</div>
+        <div class="config-row"><label>时区</label><input type="text" id="cfg-timezone" list="cfg-timezone-options" placeholder="Asia/Shanghai" maxlength="64" /></div>
+        <datalist id="cfg-timezone-options">
+          <option value="Asia/Shanghai"></option>
+          <option value="Asia/Tokyo"></option>
+          <option value="Asia/Singapore"></option>
+          <option value="UTC"></option>
+          <option value="Europe/London"></option>
+          <option value="Europe/Paris"></option>
+          <option value="America/New_York"></option>
+          <option value="America/Los_Angeles"></option>
+        </datalist>
+        <div style="margin-top:-4px;padding-left:122px;font-size:11px;color:var(--text-light);">只给日期、不写时区时按它理解（如 Letter 定时锁的解锁日期）。IANA 时区名，留空 = Asia/Shanghai</div>
       </div>
     </div>
 
@@ -2819,7 +2988,7 @@
     <div class="config-section" id="sec-mcp" data-sgroup="advanced">
       <h3>MCP 配置 <span class="sec-en">MCP Setup</span></h3>
       <div style="font-size:12px;color:var(--text-dim);margin-bottom:16px;line-height:1.7;">
-        生成 Claude Desktop / claude.ai 的 MCP 连接配置。14 个工具全在一个端点 /mcp 上，只需连这一条。
+        生成 Claude Desktop / claude.ai 的 MCP 连接配置。15 个工具全在一个端点 /mcp 上，只需连这一条。
       </div>
       <div style="margin-bottom:16px;padding:12px 14px;border:1px solid var(--border);border-radius:11px;background:var(--surface-solid);font-size:12px;line-height:1.7;">
         不确定 OAuth、端口和持久目录怎么选？
@@ -2865,7 +3034,7 @@
             <button onclick="copyMcpUrl('main')" title="复制 / Copy" style="padding:3px 8px;font-size:11px;white-space:nowrap;background:none;border:1px solid var(--border);border-radius:3px;cursor:pointer;color:var(--text-dim);"><i data-lucide="copy"></i></button>
           </div>
         </div>
-        <div style="margin-top:6px;font-size:11px;color:var(--text-light);">14 个工具已合并到单一连接器 /mcp，只需连这一条。</div>
+        <div style="margin-top:6px;font-size:11px;color:var(--text-light);">15 个工具已合并到单一连接器 /mcp，只需连这一条。</div>
         <div id="mcp-copy-msg" style="margin-top:4px;font-size:11px;color:var(--positive);min-height:16px;"></div>
       </div>
 
@@ -2874,34 +3043,33 @@
         <div style="font-weight:600;font-size:13px;margin-bottom:8px;">传输模式 · MCP Transport</div>
         <div id="transport-btns" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
           <button type="button" class="transport-btn" data-transport="streamable-http" onclick="switchTransport('streamable-http')" style="padding:7px 14px;font-size:12px;border:1px solid var(--border);background:none;border-radius:8px;cursor:pointer;font-family:inherit;color:var(--text);">Streamable HTTP</button>
-          <button type="button" class="transport-btn" data-transport="sse" onclick="switchTransport('sse')" style="padding:7px 14px;font-size:12px;border:1px solid var(--border);background:none;border-radius:8px;cursor:pointer;font-family:inherit;color:var(--text);">Legacy SSE</button>
           <button type="button" class="transport-btn" data-transport="stdio" onclick="switchTransport('stdio')" style="padding:7px 14px;font-size:12px;border:1px solid var(--border);background:none;border-radius:8px;cursor:pointer;font-family:inherit;color:var(--text);">stdio</button>
           <span id="transport-msg" style="margin-left:6px;font-size:11px;"></span>
         </div>
         <div style="margin-top:8px;font-size:11px;color:var(--text-light);line-height:1.7;">
           切换会写入 config.yaml + .env 并<b>自动重启服务</b>（约 10-30 秒）后生效。
           <b>Streamable HTTP</b>：Claude.ai 网页版 / Claude Code 远程（推荐默认）。
-          <b>Legacy SSE</b>：旧版 SSE 客户端兼容。
           <b style="color:var(--negative);">stdio</b>：⚠️ 仅本地 stdin/stdout MCP，切换后 <b>Dashboard 与所有 HTTP 服务会消失，且无法再从网页切回</b>（需在服务器改 config.yaml / 环境变量恢复）。
         </div>
       </div>
 
-      <!-- MCP 鉴权模式（OAuth / 静态 Token / 关闭）-->
+      <!-- MCP 鉴权模式（OAuth / OAuth+Token / 静态 Token / 关闭）-->
       <div style="margin:18px 0;padding:14px;background:var(--surface-solid);border-radius:11px;box-shadow:inset 2px 2px 5px var(--shadow-dark-subtle),inset -2px -2px 4px var(--shadow-light);">
         <div style="font-weight:600;font-size:13px;margin-bottom:8px;">MCP 鉴权</div>
         <div class="config-row" style="align-items:center;">
           <label>连接鉴权</label>
           <select id="cfg-mcp-auth" onchange="onMcpAuthModeChange()" style="flex:1;max-width:440px;min-width:0;">
             <option value="oauth">开启 OAuth（Claude.ai 网页版 / Claude Code 远程需要）</option>
+            <option value="hybrid">OAuth + 静态 Token 共存（网页与第三方客户端同时连接）</option>
             <option value="token">静态 Token 鉴权（第三方 MCP 客户端，不走 OAuth）</option>
-            <option value="off">关闭 · 免认证直连（自有前端 / GPT / GLM）</option>
+            <option value="off">关闭 · 免认证直连（仅限已确认的本机回环边界）</option>
           </select>
           <button type="button" onclick="saveMcpAuth()" title="保存并写入 config.yaml / Save &amp; write to config.yaml" style="margin-left:8px;padding:0 12px;height:32px;font-size:12px;white-space:nowrap;display:inline-flex;align-items:center;gap:4px;"><i data-lucide="save"></i> 保存 Save</button>
           <span id="mcp-auth-msg" style="margin-left:8px;font-size:11px;"></span>
         </div>
         <div style="margin-top:6px;font-size:11px;color:var(--text-light);line-height:1.7;">
-          三选一，<b>不会叠加</b>：选 OAuth 就不认 Token，选 Token 就不认 OAuth。改动写入 config.yaml，<b>需重启服务后生效</b>。
-          关闭鉴权后任何能访问 /mcp 的人都能读写记忆；静态 Token 泄露也等同公开访问——<b>无论选哪种模式都请勿把服务直接暴露公网</b>（放内网，或在反代层另加一道鉴权）。
+          共存模式保留 OAuth 动态注册，并让同一 <code>Authorization: Bearer</code> 入口同时接受预置静态 Token；改动写入 config.yaml，<b>需重启服务后生效</b>。
+          关闭鉴权后任何能访问 /mcp 的人都能读写记忆，系统默认只允许已确认的本机回环边界。静态 Token 泄露也等同公开访问——<b>公网连接必须使用 HTTPS，并妥善保管凭据</b>。
         </div>
 
         <div id="mcp-token-panel" style="display:none;margin-top:12px;padding:12px;border:1px solid var(--border);border-radius:9px;">
@@ -2920,7 +3088,7 @@
             </div>
             <div style="margin-top:10px;color:var(--text-light);">
               用法：请求头二选一 —— <code>Authorization: Bearer &lt;token&gt;</code> 或 <code>Ombre-MCP-Token: &lt;token&gt;</code>。
-              切换鉴权模式需重启生效；重新生成 Token <b>立即生效，无需重启</b>。
+               共存模式下 OAuth 客户端仍走授权流程；切换鉴权模式需重启生效。当前进程已处于 Token/共存模式时，重新生成 Token <b>立即生效，无需重启</b>。
             </div>
           </div>
         </div>
@@ -3137,6 +3305,10 @@
     <!-- Setup form -->
     <div id="auth-setup-form" style="display:none;">
       <p style="font-size:13px;color:var(--text-dim);margin-bottom:16px;">首次使用，请设置访问密码 / First time here — please set an access password</p>
+      <div id="auth-setup-remote-warning" style="display:none;text-align:left;font-size:12px;line-height:1.7;color:var(--warning,#d29922);background:rgba(210,153,34,0.12);border:1px solid rgba(210,153,34,0.4);border-radius:10px;padding:10px 12px;margin-bottom:14px;">
+        ⚠️ 检测到你不是从本机（localhost/127.0.0.1）访问的——首次设置密码的接口只信任本机连接，这里填了提交大概率会被服务端拒绝。<br>
+        请改为 SSH 登录服务器，在 <code>.env</code> 里设置 <code>OMBRE_DASHBOARD_PASSWORD</code> 后重启服务；或设置 <code>OMBRE_SETUP_TOKEN</code> 后用 <code>curl</code> 带 <code>X-Ombre-Setup-Token</code> 头远程调用一次 <code>/auth/setup</code>。
+      </div>
       <input type="password" id="auth-setup-pwd" placeholder="设置密码（至少6位）/ Password (6+ chars)" style="display:block;width:100%;padding:10px 16px;border:1px solid var(--border);border-radius:10px;background:var(--surface-solid);color:var(--text);font-size:14px;margin-bottom:10px;" />
       <input type="password" id="auth-setup-pwd2" placeholder="确认密码 / Confirm password" style="display:block;width:100%;padding:10px 16px;border:1px solid var(--border);border-radius:10px;background:var(--surface-solid);color:var(--text);font-size:14px;margin-bottom:12px;" onkeydown="if(event.key==='Enter')doSetup()" />
       <details style="margin-bottom:16px;text-align:left;">
@@ -3312,14 +3484,42 @@ function beginAuthenticatedDashboardSession() {
 }
 
 async function finishDashboardAuthentication() {
+  let sessionReady = false;
+  try {
+    const resp = await fetch('/auth/status', {
+      cache: 'no-store',
+      credentials: 'same-origin'
+    });
+    if (resp.ok) {
+      const data = await resp.json();
+      sessionReady = data.authenticated === true;
+    }
+  } catch (_) { /* 统一在下方显示可操作的会话错误。 */ }
+  if (!sessionReady) {
+    invalidateAuthenticatedDashboardSession();
+    document.getElementById('auth-overlay').style.display = 'flex';
+    showAuthError('验证已通过，但浏览器未建立登录会话。请检查 nginx 的 Host、X-Forwarded-Proto 与 Set-Cookie 转发。');
+    return false;
+  }
+  document.getElementById('auth-error').style.display = 'none';
   document.getElementById('auth-overlay').style.display = 'none';
   await beginAuthenticatedDashboardSession();
+  return true;
+}
+
+// 只是浏览器地址栏的启发式判断，不是权威校验——服务端 auth.py 的
+// _setup_request_allowed 才是真正说了算的那道门（还要求没有代理转发头）。
+// 这里命中不了本机也提前提示，省得用户填完密码提交才被拒绝。
+function _isLikelyLoopbackHost() {
+  var h = (window.location.hostname || '').toLowerCase();
+  if (h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '[::1]') return true;
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
 }
 
 async function checkAuth() {
   var requestedGeneration = _dashboardAuthGeneration;
   try {
-    const resp = await fetch('/auth/status');
+    const resp = await fetch('/auth/status', { cache: 'no-store' });
     const data = await resp.json();
     if (requestedGeneration !== _dashboardAuthGeneration) return false;
     if (data.setup_needed) {
@@ -3329,6 +3529,8 @@ async function checkAuth() {
       document.getElementById('auth-login-form').style.display = 'none';
       document.getElementById('auth-recovery-form').style.display = 'none';
       document.getElementById('auth-overlay').style.display = 'flex';
+      var remoteWarn = document.getElementById('auth-setup-remote-warning');
+      if (remoteWarn) remoteWarn.style.display = _isLikelyLoopbackHost() ? 'none' : 'block';
       return false;
     } else if (data.authenticated) {
       document.getElementById('auth-overlay').style.display = 'none';
@@ -3353,6 +3555,24 @@ function showAuthError(msg) {
   el.style.display = 'block';
 }
 
+async function readAuthFailure(resp, fallback) {
+  try {
+    const data = await resp.json();
+    const error = data && typeof data.error === 'string' ? data.error : '';
+    if (resp.status === 403 && error === 'Cross-origin request rejected') {
+      return '反向代理来源校验失败（HTTP 403）。请让 nginx 保留 Host、X-Forwarded-Host、X-Forwarded-Proto，并配置 OMBRE_TRUSTED_PROXY_CIDRS。';
+    }
+    if (resp.status === 403 && error.indexOf('local-only') !== -1) {
+      return '首次设置密码只信任本机连接（HTTP 403）。请 SSH 登录服务器，在 .env 里设置 '
+        + 'OMBRE_DASHBOARD_PASSWORD 后重启服务；或设置 OMBRE_SETUP_TOKEN 后用 curl 带 '
+        + 'X-Ombre-Setup-Token 头远程调用一次 /auth/setup。';
+    }
+    return error || fallback || ('登录请求失败（HTTP ' + resp.status + '）');
+  } catch (_) {
+    return '登录请求失败（HTTP ' + resp.status + '）：反向代理未返回 OB 的 JSON 响应，请检查 nginx 是否完整转发 /auth/*。';
+  }
+}
+
 async function doSetup() {
   const p1 = document.getElementById('auth-setup-pwd').value;
   const p2 = document.getElementById('auth-setup-pwd2').value;
@@ -3360,8 +3580,7 @@ async function doSetup() {
   if (p1 !== p2) return showAuthError('两次密码不一致');
   const resp = await fetch('/auth/setup', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({password: p1}) });
   if (!resp.ok) {
-    const d = await resp.json().catch(() => ({}));
-    return showAuthError(d.error || '设置失败');
+    return showAuthError(await readAuthFailure(resp, '设置失败'));
   }
   // 可选：同时保存安全问题
   const q = (document.getElementById('auth-setup-q')?.value || '').trim();
@@ -3407,12 +3626,23 @@ async function doRecover() {
 
 async function doLogin() {
   const pwd = document.getElementById('auth-login-pwd').value;
-  const resp = await fetch('/auth/login', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({password: pwd}) });
+  let resp;
+  try {
+    resp = await fetch('/auth/login', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      credentials: 'same-origin',
+      cache: 'no-store',
+      body: JSON.stringify({password: pwd})
+    });
+  } catch (_) {
+    return showAuthError('登录请求未到达 OB，请检查网络以及 nginx 是否完整转发 /auth/*。');
+  }
   if (resp.ok) {
-    await finishDashboardAuthentication();
+    return await finishDashboardAuthentication();
   } else {
-    const d = await resp.json().catch(() => ({}));
-    showAuthError(d.detail || '密码错误');
+    showAuthError(await readAuthFailure(resp, '登录失败（HTTP ' + resp.status + '）'));
+    return false;
   }
 }
 
@@ -3488,7 +3718,7 @@ async function loadTunnelStatus() {
   const authCaution = document.getElementById('tunnel-auth-caution');
   const tunnelActive = !!d.token_set;
   if (authDanger) authDanger.style.display = (tunnelActive && d.mcp_auth_required === false) ? '' : 'none';
-  if (authCaution) authCaution.style.display = (tunnelActive && d.mcp_auth_required !== false && d.mcp_auth_mode === 'token') ? '' : 'none';
+  if (authCaution) authCaution.style.display = (tunnelActive && d.mcp_auth_required !== false && (d.mcp_auth_mode === 'token' || d.mcp_auth_mode === 'hybrid')) ? '' : 'none';
   if (d.running) {
     _setTunnelUI(true, '已连接 / Connected', 'var(--positive, #9DC880)', '停止', '');
   } else {
@@ -3879,7 +4109,7 @@ async function loadSystemDiagnostics() {
   }
 }
 
-// ====== P1 常驻系统状态条 / persistent system status bar ======
+// ====== P1 常驻系统状态条 ======
 // 只有这几项对应用户能自己动手改的设置字段；其余（契约 / 开发类检查）一律「查看详情」跳到设置体检。
 const SB_ACTION_TARGETS = {
   embedding: { field: 'cfg-emb-api-key' },   // 向量化 Key
@@ -3936,6 +4166,31 @@ function toggleStatusBanner() {
   if (!b) return;
   if (b.getAttribute('data-state') === 'ok') { gotoDiagnostics(); return; }
   b.classList.toggle('open');
+}
+
+// 顶栏会随窗口宽度、按钮换行和字体加载改变高度，状态条不能使用固定偏移。
+var _statusHeaderResizeObserver = null;
+function syncStatusBannerOffset() {
+  const header = document.querySelector('.header');
+  if (!header) return;
+  const height = Math.ceil(header.getBoundingClientRect().height);
+  document.documentElement.style.setProperty('--ob-header-height', height + 'px');
+}
+function watchStatusBannerOffset() {
+  const header = document.querySelector('.header');
+  if (!header) return;
+  syncStatusBannerOffset();
+  if (typeof ResizeObserver === 'function') {
+    _statusHeaderResizeObserver = new ResizeObserver(syncStatusBannerOffset);
+    _statusHeaderResizeObserver.observe(header);
+  } else {
+    window.addEventListener('resize', syncStatusBannerOffset);
+  }
+}
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', watchStatusBannerOffset, { once: true });
+} else {
+  watchStatusBannerOffset();
 }
 
 function renderStatusBannerCard(check) {
@@ -4374,12 +4629,24 @@ function selectAllCurrentPage(checked) {
   syncBucketSelectionUi();
 }
 
+function isKnownErasableTestBucket(id) {
+  var bucket = (allBuckets || []).find(function(item) { return item.id === id; });
+  return !!(bucket && bucket.erasable_test_data);
+}
+
 async function runBucketBatch(action) {
   var ids = Array.from(selectedBucketIds);
   if (!ids.length) return alert('请先选择记忆桶。');
   var labels = {forget:'主动遗忘', resolve:'沉底', archive:'归档'};
   if (!confirm('确认对 ' + ids.length + ' 条记忆执行“' + labels[action] + '”？')) return;
-  var res = await authFetch('/api/buckets/batch', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ids:ids, action:action})});
+  var reason = '';
+  var allKnownTests = ids.every(isKnownErasableTestBucket);
+  if (action === 'archive' && !allKnownTests) {
+    reason = prompt('Why should these memories be archived? A reason is required.');
+    if (reason === null) return;
+    if (!reason.trim()) return alert('Archive reason is required.');
+  }
+  var res = await authFetch('/api/buckets/batch', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ids:ids, action:action, reason:reason})});
   if (!res) return;
   var data = await readJsonSafe(res);
   if (!res.ok) return alert(data.error || '批量操作失败');
@@ -4429,6 +4696,7 @@ function activateDashboardTab(tab) {
     if (target !== 'network' && _netRAF) { cancelAnimationFrame(_netRAF); _netRAF = null; }
     if (target === 'network') pending.push(loadNetwork());
     if (target === 'plan') pending.push(loadPlans());
+    if (target === 'list') pending.push(loadBuckets());
     if (target === 'import') pending.push(pollImportStatus(), loadImportResults());
     if (target === 'logs') pending.push(loadLogs(), loadOBErrors());
     if (target === 'v3-debug') pending.push(loadV3Debug());
@@ -4669,7 +4937,8 @@ function _paintBuckets() {
     // iter 1.8: dont_surface = 主动遗忘（仍在磁盘） / first_of_kind = 首次出现的标签组合
     // 图标：feel→计算表情、letter→信封、pinned→可发光的钉、其余沿用原逻辑
     var iconCls = 'icon', iconHtml;
-    if (b.dont_surface)        iconHtml = '<i data-lucide="eye-off"></i>';
+    if (b.letter_locked)       iconHtml = '<i data-lucide="lock-keyhole"></i>';
+    else if (b.dont_surface)   iconHtml = '<i data-lucide="eye-off"></i>';
     else if (b.pinned)       { iconHtml = '<i data-lucide="pin"></i>'; iconCls = 'icon pin-ic'; }
     else if (b.type === 'feel')   iconHtml = feelFace(b.valence, b.arousal);
     else if (b.type === 'letter') iconHtml = '<i data-lucide="mail"></i>';
@@ -4677,6 +4946,7 @@ function _paintBuckets() {
     else if (b.resolved)     iconHtml = '<i data-lucide="moon"></i>';
     else                     iconHtml = '<i data-lucide="message-circle"></i>';
     var firstBadge = b.first_of_kind ? ' <i data-lucide="sparkles" title="首次出现" style="width:12px;height:12px;color:var(--accent);vertical-align:-1px;"></i>' : '';
+    var importedBadge = b.imported ? ' <span title="由对话导入" style="font-size:10px;color:var(--accent);border:1px solid var(--accent);border-radius:999px;padding:1px 5px;white-space:nowrap;">被导入</span>' : '';
     var vPos = Math.round(b.valence * 100);
     var modelV = b.model_valence != null ? ' → V' + b.model_valence.toFixed(1) : '';
     var activityTime = firstValidBucketTime(
@@ -4705,7 +4975,7 @@ function _paintBuckets() {
       '<div class="bucket-row-top">' +
         '<input class="bucket-select" type="checkbox" data-id="' + escAttr(b.id) + '" onclick="event.stopPropagation()" onchange="toggleBucketSelection(this.dataset.id,this.checked)"' + (selectedBucketIds.has(b.id) ? ' checked' : '') + '>' +
         '<span class="' + iconCls + '">' + iconHtml + '</span>' +
-        '<span class="name" title="' + escAttr(b.name) + '">' + esc(b.name) + firstBadge + '</span>' +
+        '<span class="name" title="' + escAttr(b.name) + '">' + esc(b.name) + firstBadge + importedBadge + '</span>' +
         '<div class="bucket-row-tags">' +
           domainHtml +
           emotionHtml +
@@ -4743,6 +5013,26 @@ function _localBucketMatches(query) {
   return name.concat(other);                          // 桶名匹配排最前
 }
 
+function normalizeMeaningItems(value) {
+  var values = Array.isArray(value)
+    ? value
+    : (typeof value === 'string' ? [value] : []);
+  return values.map(function(item) {
+    return typeof item === 'string' ? item.trim() : '';
+  }).filter(function(item) { return item.length > 0; });
+}
+
+function renderMeaningHtml(value) {
+  var items = normalizeMeaningItems(value);
+  if (!items.length) return '';
+  return '<section class="meaning-block" data-field="meaning" aria-label="Meaning / 为什么值得被想起">' +
+    '<div class="meaning-block-label">MEANING · 为什么值得被想起</div>' +
+    items.map(function(item) {
+      return '<blockquote class="meaning-quote">❝ ' + esc(item) + ' ❞</blockquote>';
+    }).join('') +
+  '</section>';
+}
+
 async function searchBuckets(query) {
   var seen = {}, merged = [];
   _localBucketMatches(query).forEach(function(b) { if (!seen[b.id]) { seen[b.id] = 1; merged.push(b); } });
@@ -4774,6 +5064,25 @@ async function showDetail(id) {
     var meta = b.metadata || {};
     // content 是可无损写回的原始 Markdown；display_content 仅供详情展示。
     var displayContent = typeof b.display_content === 'string' ? b.display_content : (b.content || '');
+    if (b.letter_locked) {
+      panel.classList.add('letter-mode');
+      panel.classList.remove('anchor-mode');
+      var lockUntil = meta.lock_type === 'timed' && meta.unlock_date
+        ? '<div class="field"><label>解锁时间 / Unlock</label>' + esc(String(meta.unlock_date).replace('T', ' ').slice(0, 19)) + '</div>'
+        : '';
+      content.innerHTML =
+        '<h2><i data-lucide="lock-keyhole" style="width:18px;height:18px;vertical-align:-3px;"></i> ' + esc(meta.name || '一封上锁的信') + '</h2>' +
+        '<div class="detail-meta letter-lock-meta">' +
+          '<div class="field"><label>ID</label>' + esc(id) + '</div>' +
+          '<div class="field"><label>写信人 / Writer</label>' + esc(meta.writer_name || meta.author || '—') + '</div>' +
+          '<div class="field"><label>日期 / Date</label>' + esc(meta.letter_date || meta.created || '—') + '</div>' +
+          '<div class="field"><label>锁类型 / Lock</label>' + esc(meta.lock_type || '—') + '</div>' +
+          lockUntil +
+        '</div>' +
+        '<div class="detail-content">' + esc(displayContent || '这封信尚未向你开放。') + '</div>';
+      if (window.lucide) lucide.createIcons();
+      return true;
+    }
     var safeValence = safeNumber(meta.valence, 0.5, 0, 1);
     var safeArousal = safeNumber(meta.arousal, 0.3, 0, 1);
     var safeModelValence = meta.model_valence == null
@@ -4786,12 +5095,21 @@ async function showDetail(id) {
     panel.classList.toggle('anchor-mode', !!meta.anchor);
     // iter 1.8: why_remembered = 这条为什么被记得（展示不计分）
     var whyHtml = meta.why_remembered ? ('<div style="margin:8px 0 16px;padding:10px 14px;border-left:3px solid var(--accent);background:var(--surface-solid);font-style:italic;color:var(--accent);font-family:\'Cormorant Garamond\',\'Noto Serif SC\',serif;line-height:1.7;">❝ ' + esc(meta.why_remembered) + ' ❞</div>') : '';
+    // meaning 是可累积的体验锚点；兼容早期手写桶中的单字符串格式。
+    var meaningHtml = renderMeaningHtml(meta.meaning);
     var firstBadge = meta.first_of_kind ? '<span style="display:inline-flex;align-items:center;gap:4px;font-size:11px;color:var(--accent);margin-left:8px;"><i data-lucide="sparkles" style="width:12px;height:12px;"></i>首次出现</span>' : '';
     var weightHtml = (meta.type === 'plan' && meta.weight != null) ? ('<div class="field"><label>承诺重量</label><span style="display:inline-block;width:80px;height:6px;background:var(--border);border-radius:3px;vertical-align:middle;overflow:hidden;"><span style="display:block;width:' + Math.round(meta.weight*100) + '%;height:100%;background:var(--accent);"></span></span> ' + (meta.weight*100).toFixed(0) + '% · ' + weightAnchorLabel(meta.weight) + '</div>') : '';
     // iter 1.9 D3: triggered_by 渲染成可跳转链接
     var triggerHtml = meta.triggered_by ? ('<div class="field"><label>源 bucket</label><a href="#" data-bucket-id="' + escAttr(meta.triggered_by) + '" onclick="showDetail(this.dataset.bucketId);return false" style="color:var(--accent);text-decoration:underline;font-size:11px;">' + esc(meta.triggered_by) + ' →</a></div>') : '';
     // iter 1.9 D2: 反向链——这条触发了哪些 feel
     var triggeredFeelsHtml = '';
+    var deletionRequest = b.deletion_request || null;
+    var deletionRequestHtml = '';
+    if (deletionRequest && deletionRequest.status === 'pending') {
+      deletionRequestHtml = '<div style="margin:10px 0;padding:10px 14px;border-left:3px solid var(--negative);background:var(--surface-solid);">删除申请待 AI 决定 / Deletion pending: ' + esc(deletionRequest.human_reason || '') + ' <button data-bucket-id="' + escAttr(id) + '" onclick="withdrawBucketDeletion(this.dataset.bucketId)" class="icon-btn">撤回 / Withdraw</button></div>';
+    } else if (deletionRequest && deletionRequest.status === 'rejected') {
+      deletionRequestHtml = '<div style="margin:10px 0;padding:10px 14px;border-left:3px solid var(--accent);background:var(--surface-solid);">删除申请被拒绝 / Rejected' + (deletionRequest.ai_reason ? ': ' + esc(deletionRequest.ai_reason) : '') + '</div>';
+    }
     if (b.triggered_feels && b.triggered_feels.length) {
       triggeredFeelsHtml = '<div style="margin:14px 0;padding:10px 14px;border-left:3px solid var(--accent);background:var(--surface-solid);">' +
         '<div style="font-size:11px;color:var(--text-dim);margin-bottom:6px;">这条触发了 ' + b.triggered_feels.length + ' 条 feel：</div>' +
@@ -4802,8 +5120,9 @@ async function showDetail(id) {
         '</ul></div>';
     }
     content.innerHTML =
-      '<h2>' + esc(meta.name || id) + firstBadge + '</h2>' +
+      '<h2>' + esc(meta.title || meta.name || id) + firstBadge + '</h2>' +
       whyHtml +
+      meaningHtml +
       '<div class="detail-meta">' +
         '<div class="field"><label>ID</label>' + esc(id) + '</div>' +
         '<div class="field"><label>类型 / Type</label>' + esc(meta.type || 'dynamic') + '</div>' +
@@ -4813,11 +5132,12 @@ async function showDetail(id) {
         '<div class="field"><label>唤醒度 / Arousal</label>A' + safeArousal.toFixed(2) + '</div>' +
         '<div class="field"><label>模型视角 / Model view</label>' + (safeModelValence != null ? 'V' + safeModelValence.toFixed(2) : '—') + '</div>' +
         '<div class="field"><label>重要度 / Importance</label>' + safeImportance + '/10</div>' +
-        '<div class="field"><label>权重分 / Weight</label>' + (b.score != null ? b.score.toFixed(4) : '—') + '</div>' +
+        '<div class="field"><label>活跃度分 / Activity score</label>' + (b.score != null ? b.score.toFixed(4) : '—') + '</div>' +
         '<div class="field"><label>激活次数 / Activations</label>' + safeActivationCount + '</div>' +
         '<div class="field"><label>已解决 / Resolved</label>' + (meta.resolved ? _SV.ok : '—') + '</div>' +
         '<div class="field"><label>已消化 / Digested</label>' + (meta.digested ? _SV.ok : '—') + '</div>' +
         '<div class="field"><label>钉选 / Pinned</label>' + (meta.pinned ? _SV.ok : '—') + '</div>' +
+        '<div class="field"><label>导入来源 / Imported</label>' + (meta.imported || meta.source_tool === 'import' ? '被导入' : '—') + '</div>' +
         '<div class="field"><label>Anchor</label>' + (meta.anchor ? _SV.anchor+' 坐标系 / anchor' : '—') + '</div>' +
         '<div class="field"><label>创建 / Created</label>' + esc(meta.created || '—') + '</div>' +
         '<div class="field"><label>最后活跃 / Last active</label>' + esc(meta.last_active || '—') + '</div>' +
@@ -4825,13 +5145,13 @@ async function showDetail(id) {
         triggerHtml +
       '</div>' +
       triggeredFeelsHtml +
+      deletionRequestHtml +
       '<div class="detail-actions" style="display:flex;gap:8px;flex-wrap:wrap;margin:12px 0;">' +
         '<button data-bucket-id="' + escAttr(id) + '" onclick="bucketPin(this.dataset.bucketId)" class="icon-btn">' + (meta.pinned ? '<i data-lucide="pin-off"></i> 取消钉选' : '<i data-lucide="pin"></i> 钉选') + '</button>' +
         '<button data-bucket-id="' + escAttr(id) + '" onclick="bucketAnchor(this.dataset.bucketId)" class="icon-btn" title="anchor = 坐标系，不主动浮现，硬上限 24">' + (meta.anchor ? '<i data-lucide="anchor"></i> 释放 anchor' : '<i data-lucide="anchor"></i> 设为 anchor') + '</button>' +
         '<button data-bucket-id="' + escAttr(id) + '" onclick="bucketResolve(this.dataset.bucketId)" class="icon-btn">' + (meta.resolved ? '<i data-lucide="rotate-ccw"></i> 取消已解决' : '<i data-lucide="check"></i> 标记已解决') + '</button>' +
         '<button data-bucket-id="' + escAttr(id) + '" onclick="bucketForget(this.dataset.bucketId)" class="icon-btn">' + (meta.dont_surface ? '<i data-lucide="eye"></i> 重新允许浮现' : '<i data-lucide="eye-off"></i> 主动遗忘') + '</button>' +
         '<button data-bucket-id="' + escAttr(id) + '" onclick="bucketArchive(this.dataset.bucketId)" class="icon-btn"><i data-lucide="archive"></i> 归档</button>' +
-        '<button data-bucket-id="' + escAttr(id) + '" onclick="bucketDelete(this.dataset.bucketId)" class="icon-btn" style="color:#b85c3c;"><i data-lucide="trash-2"></i> 删除到档案</button>' +
       '</div>' +
       '<div class="detail-content">' + esc(displayContent) + '</div>' +
       renderEditForm(id, Object.assign({}, meta, {_content_for_edit: b.content}));
@@ -4845,7 +5165,23 @@ async function showDetail(id) {
 
 async function bucketPin(id) {
   try {
-    var res = await fetch(BASE + '/api/bucket/' + encodeURIComponent(id) + '/pin', { method: 'POST' });
+    var current = (allBuckets || []).find(function(b) { return b.id === id; });
+    var body = {};
+    if (current && current.pinned) {
+      var rawImportance = prompt('解除钉选后，请设定新的 importance（1-10）：', '5');
+      if (rawImportance === null) return;
+      var nextImportance = Number(rawImportance);
+      if (!Number.isInteger(nextImportance) || nextImportance < 1 || nextImportance > 10) {
+        alert('importance 必须是 1-10 的整数。');
+        return;
+      }
+      body.importance = nextImportance;
+    }
+    var res = await fetch(BASE + '/api/bucket/' + encodeURIComponent(id) + '/pin', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
     if (!res.ok) throw new Error(await res.text());
     await showDetail(id);
     await loadBuckets();
@@ -4936,27 +5272,27 @@ async function bucketResolve(id) {
 }
 
 async function bucketArchive(id) {
-  if (!confirm('确认归档此桶？归档后将从浮现/搜索中隐藏，但文件仍保留在 archive/ 目录。\n\nArchive this bucket? It will be hidden from surfacing/search, but the file stays in archive/.')) return;
+  if (!confirm('确认申请归档此桶？需填写理由并由 AI 审批；批准后它将从浮现/搜索中隐藏，文件仍保留在 archive/ 目录并标记为已删除。\n\nRequest archive? AI approval is required. The file remains in archive/ with a deletion marker.')) return;
+  var reason = '';
+  if (!isKnownErasableTestBucket(id)) {
+    reason = prompt('为什么要归档这条记忆？必须填写理由，由 AI 审批。 / Why should this memory be archived? AI approval is required.');
+    if (reason === null) return;
+    if (!reason.trim()) { alert('Archive reason is required.'); return; }
+  }
   try {
-    var res = await fetch(BASE + '/api/bucket/' + encodeURIComponent(id) + '/archive', { method: 'POST' });
+    var res = await fetch(BASE + '/api/bucket/' + encodeURIComponent(id) + '/archive', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({reason: reason}) });
     if (!res.ok) throw new Error(await res.text());
     closeDetail();
     loadBuckets();
   } catch (e) { alert('归档失败: ' + e.message); }
 }
 
-async function bucketDelete(id) {
-  if (!confirm('这会把此记忆桶移入删除档案，并从日常界面隐藏；文件仍保留在 archive/ 中。继续？\n\nThis moves the bucket to the delete archive and hides it from everyday views; the file stays in archive/. Continue?')) return;
+async function withdrawBucketDeletion(id) {
   try {
-    var res = await fetch(BASE + '/api/bucket/' + encodeURIComponent(id) + '?confirm=true', { method: 'DELETE' });
+    var res = await fetch(BASE + '/api/bucket/' + encodeURIComponent(id) + '/deletion-request/withdraw', {method:'POST'});
     if (!res.ok) throw new Error(await res.text());
-    closeDetail();
-    // 「放下」：让这条记忆轻轻消散，而不是直接消失
-    var sel = (window.CSS && CSS.escape) ? CSS.escape(id) : id;
-    var row = document.querySelector('.bucket-row[data-id="' + sel + '"]');
-    if (row) { row.classList.add('dissolving'); setTimeout(loadBuckets, 600); }
-    else { loadBuckets(); }
-  } catch (e) { alert('删除失败: ' + e.message); }
+    await showDetail(id); loadBuckets();
+  } catch (e) { alert('撤回失败 / Withdrawal failed: ' + e.message); }
 }
 
 function closeDetail() {
@@ -6311,7 +6647,7 @@ function _renderEmbMigrateStatus(s) {
     var sample = s.failed_items.slice(0, 3).map(function(it) { return esc(it.bucket_id) + ': ' + esc(it.error); }).join('<br>');
     html += '<br><span style="color:var(--negative,#c33)">失败样本（前 3）：<br>' + sample + '</span>';
   }
-  if (s.phase === 'failed' || (s.phase === 'completed' && s.failed_count > 0)) {
+  if (s.phase === 'failed' || s.phase === 'publish_failed' || (s.phase === 'completed' && s.failed_count > 0)) {
     if (s.tail_log && s.tail_log.length) {
       html += '<br><details style="margin-top:6px;"><summary>最近 15 行错误日志（点开复制给 AI 排查，不要发给作者）</summary>'
         + '<pre style="white-space:pre-wrap;font-size:11px;background:#222;color:#eee;padding:8px;border-radius:4px;max-height:240px;overflow:auto;">'
@@ -6329,7 +6665,7 @@ async function pollEmbMigrateStatus() {
     var d = await r.json();
     if (!d || !d.ok) return;
     _renderEmbMigrateStatus(d.status);
-    if (d.status && (d.status.phase === 'completed' || d.status.phase === 'failed') && !d.running) {
+    if (d.status && ['completed', 'failed', 'publish_failed'].includes(d.status.phase) && !d.running) {
       // 停止轮询，刷新一次摘要
       if (_embMigratePollTimer) { clearInterval(_embMigratePollTimer); _embMigratePollTimer = null; }
       refreshEmbInfo();
@@ -6854,10 +7190,14 @@ async function runGithubImport(force) {
     });
     var d = await readJsonSafe(res);
     if (d.ok) {
+      var restoredBuckets = Number.isInteger(d.buckets_imported) ? d.buckets_imported : (d.imported || 0);
+      var restoredSources = Number.isInteger(d.sources_imported) && d.sources_imported > 0
+        ? '，安装 ' + d.sources_imported + ' 份原文证据' : '';
       var extra = (d.skipped ? '，跳过 ' + d.skipped : '') + (d.truncated ? '（⚠️ 仓库文件过多被截断，部分未导入）' : '');
-      msg.innerHTML = _SV.ok + ' 导入完成：恢复 ' + (d.imported||0) + ' 条记忆' + extra
-        + (d.pre_import_backup ? '<br><span style="color:var(--text-light)">本地备份：<code>' + esc(d.pre_import_backup) + '</code></span>' : '');
-      msg.style.color = 'var(--success, green)';
+      msg.innerHTML = _SV.ok + ' 导入完成：恢复 ' + restoredBuckets + ' 条记忆' + restoredSources + extra
+        + (d.pre_import_backup ? '<br><span style="color:var(--text-light)">本地备份：<code>' + esc(d.pre_import_backup) + '</code></span>' : '')
+        + (d.integrity_warning ? '<br><span style="color:var(--negative)">' + _SV.warn + ' ' + esc(d.integrity_warning) + '</span>' : '');
+      msg.style.color = d.integrity_warning ? 'var(--accent)' : 'var(--success, green)';
       // 导入后自动重建向量（恢复的桶 embeddings.db 里还没有）
       if (typeof startBackfill === 'function') {
         msg.innerHTML += '<br>正在为恢复的记忆重建向量索引…';
@@ -6936,7 +7276,8 @@ async function loadConfig() {
     var dehyNotice = document.getElementById('dehy-key-notice');
     if (dehyNotice) dehyNotice.style.display = cfg.dehydration.api_key_masked ? 'none' : '';
     document.getElementById('cfg-dehy-maxtokens').value = cfg.dehydration.max_tokens || 1024;
-    document.getElementById('cfg-dehy-temp').value = cfg.dehydration.temperature || 0.1;
+    document.getElementById('cfg-dehy-temp').value = cfg.dehydration.temperature != null
+      ? cfg.dehydration.temperature : 0.1;
     document.getElementById('cfg-emb-enabled').value = cfg.embedding.enabled ? 'true' : 'false';
     document.getElementById('cfg-emb-model').value = cfg.embedding.model || '';
     var embFmtEl = document.getElementById('cfg-emb-format');
@@ -6954,16 +7295,32 @@ async function loadConfig() {
     // 加载当前 embedding 后端摘要 + 启动迁移轮询（只刷一次摘要，迁移状态独立轮询）
     refreshEmbInfo();
     refreshEnvConfig();
-    document.getElementById('cfg-merge').value = cfg.merge_threshold || 75;
+    document.getElementById('cfg-merge').value = cfg.merge_threshold != null
+      ? cfg.merge_threshold : 75;
     var mcpAuthEl = document.getElementById('cfg-mcp-auth');
     if (mcpAuthEl) {
-      mcpAuthEl.value = cfg.mcp_require_auth
-        ? (cfg.mcp_auth_mode === 'token' ? 'token' : 'oauth')
-        : 'off';
+      const configuredAuthMode = ['oauth', 'token', 'hybrid'].includes(cfg.mcp_auth_mode)
+        ? cfg.mcp_auth_mode : 'oauth';
+      mcpAuthEl.value = cfg.mcp_require_auth ? configuredAuthMode : 'off';
     }
     window._mcpTokenConfigured = !!cfg.mcp_token_configured;
     window._mcpTokenHint = cfg.mcp_token_hint || null;
     onMcpAuthModeChange();
+    var mcpNetwork = cfg.mcp_network_security || {};
+    var mcpAuthMsg = document.getElementById('mcp-auth-msg');
+    if (mcpAuthMsg && mcpNetwork.guard_active) {
+      mcpAuthMsg.style.color = 'var(--warning)';
+      mcpAuthMsg.textContent = '当前配置或环境变量请求关闭鉴权；当前生效：安全门禁已强制开启鉴权。'
+        + (mcpNetwork.reason ? ' 原因：' + mcpNetwork.reason : '');
+    } else if (mcpAuthMsg && mcpNetwork.override_active) {
+      mcpAuthMsg.style.color = 'var(--negative)';
+      mcpAuthMsg.textContent = '高风险：已显式允许非回环免鉴权。'
+        + (mcpNetwork.reason ? ' ' + mcpNetwork.reason : '')
+        + (mcpNetwork.auth_environment_override
+          ? ' OMBRE_MCP_REQUIRE_AUTH 仍由平台环境变量控制。' : '');
+    } else if (mcpAuthMsg) {
+      mcpAuthMsg.textContent = '';
+    }
     const publicUrl = String((cfg.deployment || {}).public_url || '');
     const publicMode = document.querySelector('input[name="mcp-mode"][value="public"]');
     const localMode = document.querySelector('input[name="mcp-mode"][value="local"]');
@@ -6984,7 +7341,8 @@ async function loadConfig() {
     var sf = cfg.surfacing || {};
     document.getElementById('cfg-sf-breath-results').value = sf.breath_max_results || 20;
     document.getElementById('cfg-sf-breath-tokens').value = sf.breath_max_tokens || 10000;
-    document.getElementById('cfg-sf-feel-tokens').value = sf.feel_max_tokens || 6000;
+    document.getElementById('cfg-sf-feel-tokens').value = sf.feel_max_tokens || 15000;
+    document.getElementById('cfg-timezone').value = cfg.timezone || 'Asia/Shanghai';
     document.getElementById('config-readonly').innerHTML =
       'Transport（已保存）: <strong>' + esc(cfg.transport) + '</strong>'
       + '<br>Transport（当前生效）: <strong>' + esc(cfg.transport_effective || cfg.transport) + '</strong>'
@@ -7078,7 +7436,7 @@ async function refreshEnvShadowWarning() {
     OMBRE_EMBED_MODEL: '向量化 Model',
     OMBRE_EMBED_API_KEY: '向量化 API Key',
     OMBRE_EMBED_TIMEOUT_SECONDS: '向量化 Timeout',
-    OMBRE_MCP_REQUIRE_AUTH: 'MCP OAuth 开关',
+    OMBRE_MCP_REQUIRE_AUTH: 'MCP 鉴权开关',
   };
   try {
     var r = await authFetch('/api/env-vars');
@@ -7256,12 +7614,16 @@ async function saveEmbedKey() {
 }
 
 async function saveConfig(persist) {
+  var dehyTemperatureRaw = document.getElementById('cfg-dehy-temp').value.trim();
+  var mergeThresholdRaw = document.getElementById('cfg-merge').value.trim();
+  var dehyTemperature = dehyTemperatureRaw === '' ? NaN : Number(dehyTemperatureRaw);
+  var mergeThreshold = mergeThresholdRaw === '' ? NaN : Number(mergeThresholdRaw);
   var body = {
     dehydration: {
       model: document.getElementById('cfg-dehy-model').value,
       base_url: document.getElementById('cfg-dehy-url').value,
       max_tokens: parseInt(document.getElementById('cfg-dehy-maxtokens').value) || 1024,
-      temperature: parseFloat(document.getElementById('cfg-dehy-temp').value) || 0.1,
+      temperature: Number.isFinite(dehyTemperature) ? dehyTemperature : 0.1,
       api_format: (document.getElementById('cfg-dehy-format') || {value:'openai_compat'}).value || 'openai_compat',
     },
     embedding: {
@@ -7271,12 +7633,13 @@ async function saveConfig(persist) {
       backend: document.getElementById('cfg-emb-backend').value,
       api_format: (document.getElementById('cfg-emb-format') || {value:'openai_compat'}).value || 'openai_compat',
     },
-    merge_threshold: parseInt(document.getElementById('cfg-merge').value) || 75,
+    merge_threshold: Number.isFinite(mergeThreshold) ? mergeThreshold : 75,
     surfacing: {
       breath_max_results: parseInt(document.getElementById('cfg-sf-breath-results').value) || 20,
       breath_max_tokens: parseInt(document.getElementById('cfg-sf-breath-tokens').value) || 10000,
-      feel_max_tokens: parseInt(document.getElementById('cfg-sf-feel-tokens').value) || 6000,
+      feel_max_tokens: parseInt(document.getElementById('cfg-sf-feel-tokens').value) || 15000,
     },
+    timezone: (document.getElementById('cfg-timezone').value || '').trim(),
     persist: persist,
   };
   var status = document.getElementById('config-status');
@@ -7361,6 +7724,8 @@ loadVersionBadge();
     }
 
     var info = await loadDeployInfo();
+    var allowPipBox = document.getElementById('update-allow-pip');
+    if (allowPipBox) allowPipBox.checked = !!info.update_allow_pip_install;
     var deployEl = document.getElementById('ver-deploy-info');
     if (deployEl) {
       deployEl.textContent = [
@@ -7412,6 +7777,33 @@ loadVersionBadge();
     el.style.display = '';
   }
 
+  window.toggleUpdateAllowPip = async function(checked) {
+    var box = document.getElementById('update-allow-pip');
+    var msg = document.getElementById('update-allow-pip-msg');
+    if (msg) { msg.style.color = 'var(--text-dim)'; msg.textContent = '保存中…'; }
+    try {
+      var r = await authFetch('/api/update-settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ allow_pip_install: checked }),
+      });
+      var d = r ? await r.json() : {};
+      if (d.ok) {
+        if (_deployInfo) _deployInfo.update_allow_pip_install = d.allow_pip_install;
+        if (msg) {
+          msg.style.color = 'var(--positive)';
+          msg.textContent = d.allow_pip_install ? '已开启，立即生效，无需重启。' : '已关闭。';
+        }
+      } else {
+        if (box) box.checked = !checked;
+        if (msg) { msg.style.color = 'var(--negative)'; msg.textContent = d.error || '保存失败'; }
+      }
+    } catch (e) {
+      if (box) box.checked = !checked;
+      if (msg) { msg.style.color = 'var(--negative)'; msg.textContent = e.message; }
+    }
+  };
+
   window.doHotUpdate = async function() {
     var btn = document.getElementById('btn-hot-update');
     var logWrap = document.getElementById('ver-update-log');
@@ -7431,7 +7823,8 @@ loadVersionBadge();
     if (logBox)  logBox.textContent = '';
     if (doneEl)  doneEl.style.display = 'none';
 
-    var log = function(line) { if (logBox) logBox.textContent += line + '\n'; };
+    var baseLog = '';
+    var log = function(line) { baseLog += line + '\n'; if (logBox) logBox.textContent = baseLog; };
 
     try {
       // 热更新不是可重试写操作，不能走会对瞬时 502/503/504 自动重试的
@@ -7482,15 +7875,19 @@ loadVersionBadge();
       }
 
       if (restarting) {
-        // 轮询 /api/version 直到服务恢复
+        // 轮询 /api/version 直到服务恢复。等待提示原地刷新省略号（1~3 个循环），
+        // 不再每次追加新行——之前每 2 秒挂一行「等待服务恢复…」，60 秒内能刷出
+        // 30 行，日志框疯狂向下滚动，体验很差（用户反馈：卡在这一步"很掉san"）。
         var newVer = null;
+        var dotCount = 0;
         for (var i = 0; i < 30; i++) {
           await new Promise(function(res) { setTimeout(res, 2000); });
           try {
             var vr = await fetch(BASE + '/api/version');
             if (vr.ok) { var vd = await vr.json(); newVer = vd.version; break; }
           } catch(_) {}
-          log('等待服务恢复…');
+          dotCount = (dotCount % 3) + 1;
+          if (logBox) logBox.textContent = baseLog + '等待服务恢复' + '.'.repeat(dotCount);
         }
         if (newVer) {
           log('服务已恢复，新版本：v' + newVer);
@@ -7832,7 +8229,7 @@ function renderImportPreflight(data) {
     + ' · 分块：<b>' + (data.chunks_count || 0) + '</b>'
     + ' · 预计 API 调用：<b>' + (data.estimated_api_calls || 0) + '</b>'
     + ' · 大小：<b>' + Math.round((data.size_bytes || 0) / 1024) + ' KB</b>'
-    + (!data.llm_ready ? '<br><span style="color:var(--negative)">压缩/打标 LLM 未就绪，暂不能导入。</span>' : '')
+    + (data.requires_llm !== false && !data.llm_ready ? '<br><span style="color:var(--negative)">压缩/打标 LLM 未就绪，暂不能导入。</span>' : '')
     + (data.import_running ? '<br><span style="color:var(--negative)">已有导入任务运行中，请完成后再开始。</span>' : '');
   const warnings = data.warnings || [];
   if (warn) {
@@ -7925,17 +8322,31 @@ function updateImportUI(s) {
   document.getElementById('import-progress-text').textContent = s.processed + '/' + s.total_chunks;
   document.getElementById('import-api-calls').textContent = s.api_calls;
   document.getElementById('import-created').textContent = s.memories_created;
-  document.getElementById('import-merged').textContent = s.memories_merged;
+  document.getElementById('import-skipped').textContent = s.memories_skipped || 0;
   document.getElementById('import-raw').textContent = s.memories_raw;
-  const statusMap = { running: _SV.clock+' 导入中…', paused: _SV.pause+' 已暂停', completed: _SV.ok+' 完成', error: _SV.err+' 出错' };
+  const statusMap = { running: _SV.clock+' 导入中…', paused: _SV.pause+' 已暂停', completed: _SV.ok+' 完成', partial: _SV.warn+' 部分完成', error: _SV.err+' 出错' };
   document.getElementById('import-status-text').innerHTML = statusMap[s.status] || esc(s.status);
   document.getElementById('import-pause-btn').style.display = s.status === 'running' ? '' : 'none';
   if (s.status !== 'running') clearInterval(importPollTimer);
-  if (s.status === 'completed') loadImportResults();
+  if (s.status === 'completed' || s.status === 'partial') {
+    loadImportResults();
+    loadBuckets();
+  }
   const errDiv = document.getElementById('import-errors');
-  if (s.errors && s.errors.length) {
+  const errList = document.getElementById('import-error-list');
+  const diagnostics = Array.isArray(s.diagnostics) ? s.diagnostics : [];
+  if (diagnostics.length) {
     errDiv.style.display = '';
-    errDiv.textContent = s.errors.join('\n');
+    errList.innerHTML = diagnostics.map(function(item) {
+      const solution = item.solution
+        ? '<div style="margin-top:6px;color:var(--text-dim);"><b style="color:var(--text);">解决方案：</b>' + esc(item.solution) + '</div>'
+        : '<div style="margin-top:6px;color:var(--text-dim);">暂未匹配到通用解决方案，请复制下方具体报错进行排查。</div>';
+      return '<div style="padding:10px 11px;background:var(--surface-solid);border-radius:8px;box-shadow:inset 2px 2px 5px var(--shadow-dark-subtle),inset -2px -2px 4px var(--shadow-light);">'
+        + '<div style="font-weight:700;color:var(--negative);">' + esc(item.title || '导入处理出错') + '</div>'
+        + '<code style="display:block;margin-top:6px;white-space:pre-wrap;word-break:break-word;color:var(--negative);font-family:\'Share Tech Mono\',\'SF Mono\',Consolas,monospace;">' + esc(item.error || '') + '</code>'
+        + solution + '</div>';
+    }).join('');
+    if (typeof lucide !== 'undefined') lucide.createIcons();
   } else { errDiv.style.display = 'none'; }
 }
 
@@ -7944,9 +8355,26 @@ async function pauseImport() {
 }
 
 let importResultsLoadGeneration = 0;
+let importResultsNextOffset = 0;
+const IMPORT_RESULTS_PAGE_SIZE = 50;
+
+function updateImportResultsMoreButton(hasMore) {
+  const button = document.getElementById('import-results-more');
+  if (button) button.style.display = hasMore ? 'block' : 'none';
+}
+
+async function loadMoreImportResults() {
+  if (importResultsNextOffset === null) return true;
+  return loadImportResults({append:true, preserveScroll:true});
+}
+
 async function loadImportResults(options) {
   const container = document.getElementById('import-results-list');
+  if (!container) return false;
   const opts = options && typeof options === 'object' ? options : {};
+  const append = opts.append === true;
+  const offset = append ? importResultsNextOffset : 0;
+  if (append && offset === null) return true;
   const generation = ++importResultsLoadGeneration;
   const preserveScroll = opts.preserveScroll === true;
   const requestedScrollTop = Number(opts.scrollTop);
@@ -7954,29 +8382,39 @@ async function loadImportResults(options) {
     ? (Number.isFinite(requestedScrollTop) ? Math.max(0, requestedScrollTop) : container.scrollTop)
     : 0;
   container.setAttribute('aria-busy', 'true');
-  if (!preserveScroll) container.innerHTML = '<div class="loading">加载中… / Loading…</div>';
+  if (!append && !preserveScroll) container.innerHTML = '<div class="loading">加载中… / Loading…</div>';
   try {
-    const res = await fetch(BASE + '/api/import/results?limit=30');
+    const query = '?limit=' + IMPORT_RESULTS_PAGE_SIZE + '&offset=' + Number(offset || 0);
+    const res = await fetch(BASE + '/api/import/results' + query);
     const data = await readJsonSafe(res);
     if (generation !== importResultsLoadGeneration) return false;
     if (!res.ok) throw new Error((data && data.error) || ('HTTP ' + res.status));
     if (!data || typeof data !== 'object' || Array.isArray(data) || !Array.isArray(data.buckets)) {
       throw new Error('导入结果响应无效 / Invalid import results response');
     }
-    if (!data.buckets || !data.buckets.length) {
-      container.innerHTML = '<p style="color:var(--text-dim)">暂无记忆桶</p>';
+
+    const nextOffset = Number(data.next_offset);
+    importResultsNextOffset = data.has_more && Number.isInteger(nextOffset) && nextOffset >= 0
+      ? nextOffset
+      : null;
+    updateImportResultsMoreButton(importResultsNextOffset !== null);
+
+    if (!data.buckets.length) {
+      if (!append) container.innerHTML = '<p style="color:var(--text-dim)">暂无已导入记忆</p>';
       if (preserveScroll) container.scrollTop = previousScrollTop;
       return true;
     }
-    container.innerHTML = data.buckets.map(b => `
+
+    const cards = data.buckets.map(b => `
       <div data-review-bucket-id="${escAttr(b.id)}" style="background:var(--surface);border-radius:12px;padding:14px;margin:8px 0;">
-        <div style="display:flex;justify-content:space-between;align-items:center;">
-          <b>${esc(b.name || b.id)}</b>
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
+          <b>${esc(b.name || b.id)} <span title="由对话导入" style="font-size:10px;color:var(--accent);border:1px solid var(--accent);border-radius:999px;padding:1px 5px;white-space:nowrap;">被导入</span></b>
           <span style="font-size:11px;color:var(--text-dim);">${esc(b.type)} | ${esc((b.domain||[]).join(','))} | imp:${Number(b.importance || 0)}</span>
         </div>
         <p style="font-size:13px;margin:6px 0;white-space:pre-wrap;">${esc(b.content)}</p>
         <div style="font-size:11px;color:var(--text-dim);margin-bottom:6px;">${esc((b.tags||[]).map(t=>'#'+t).join(' '))}</div>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        ${b.letter_item ? '<div style="font-size:12px;color:var(--text-dim);">请在「信」页管理 / Manage in Letters</div>' : ''}
+        <div style="display:${b.letter_item ? 'none' : 'flex'};gap:8px;flex-wrap:wrap;">
           <button data-bucket-id="${escAttr(b.id)}" onclick="openImportedBucketEditor(this.dataset.bucketId)" class="icon-btn" title="编辑完整记忆 / Edit full memory"><svg class="icon" aria-hidden="true"><use href="#i-edit"></use></svg> 编辑</button>
           <button data-bucket-id="${escAttr(b.id)}" onclick="reviewAction(this.dataset.bucketId,'pin')" class="icon-btn" title="固定为永久记忆"><i data-lucide="pin"></i> 固定</button>
           <button data-bucket-id="${escAttr(b.id)}" onclick="reviewAction(this.dataset.bucketId,'important')" class="icon-btn" title="标为重要"><i data-lucide="star"></i> 重要</button>
@@ -7985,20 +8423,21 @@ async function loadImportResults(options) {
         </div>
       </div>
     `).join('');
+    if (append) container.insertAdjacentHTML('beforeend', cards);
+    else container.innerHTML = cards;
     if (preserveScroll) container.scrollTop = previousScrollTop;
     return true;
   } catch(e) {
     if (generation !== importResultsLoadGeneration) return false;
-    container.innerHTML = '<p style="color:var(--negative)">加载失败: ' + esc(e.message) + '</p>';
+    if (!append) container.innerHTML = '<p style="color:var(--negative)">加载失败: ' + esc(e.message) + '</p>';
+    updateImportResultsMoreButton(importResultsNextOffset !== null);
     return false;
   } finally {
     if (generation === importResultsLoadGeneration) container.removeAttribute('aria-busy');
   }
 }
-
 async function openImportedBucketEditor(bid) {
-  // Import results intentionally contain only a short preview. Always enter
-  // through showDetail so the editor receives the complete Markdown body.
+  // 导入结果只含正文预览；先进入详情，确保编辑器拿到完整 Markdown 正文。
   if (!await showDetail(bid)) return;
   const editor = document.getElementById('bucket-edit-form');
   if (!editor) return;
@@ -8034,9 +8473,15 @@ async function detectPatterns() {
 
 async function reviewAction(bid, action) {
   try {
+    var reason = '';
+    if (action === 'delete') {
+      reason = prompt('为什么要删除这条记忆？必须填写理由。 / Why should this memory be deleted?');
+      if (reason === null) return;
+      if (!reason.trim()) throw new Error('Deletion reason is required.');
+    }
     const response = await fetch(BASE + '/api/import/review', {
       method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ decisions: [{ bucket_id: bid, action }] })
+      body: JSON.stringify({ decisions: [{ bucket_id: bid, action, reason }] })
     });
     const result = await readJsonSafe(response);
     if (!response.ok || !result || result.applied !== 1 || result.errors) {
@@ -8306,7 +8751,7 @@ function onMcpAuthModeChange() {
   const sel = document.getElementById('cfg-mcp-auth');
   const panel = document.getElementById('mcp-token-panel');
   if (!sel || !panel) return;
-  panel.style.display = sel.value === 'token' ? '' : 'none';
+  panel.style.display = (sel.value === 'token' || sel.value === 'hybrid') ? '' : 'none';
   const statusEl = document.getElementById('mcp-token-status');
   if (statusEl) {
     statusEl.textContent = window._mcpTokenConfigured
@@ -8317,7 +8762,7 @@ function onMcpAuthModeChange() {
 
 async function saveMcpAuth() {
   const msg = document.getElementById('mcp-auth-msg');
-  const sel = document.getElementById('cfg-mcp-auth').value; // 'oauth' | 'token' | 'off'
+  const sel = document.getElementById('cfg-mcp-auth').value; // 'oauth' | 'hybrid' | 'token' | 'off'
   const payload = sel === 'off'
     ? { mcp_require_auth: false, persist: true }
     : { mcp_require_auth: true, mcp_auth_mode: sel, persist: true };
@@ -8330,8 +8775,10 @@ async function saveMcpAuth() {
     if (!res) return;
     const result = await res.json();
     if (result.ok) {
-      msg.style.color = result.restart_required ? 'var(--warning)' : 'var(--positive)';
-      msg.textContent = result.message || (result.restart_required ? '已保存，需要重启服务后生效' : '已保存');
+      const warnings = Array.isArray(result.warnings) ? result.warnings : [];
+      msg.style.color = (warnings.length || result.restart_required) ? 'var(--warning)' : 'var(--positive)';
+      msg.textContent = (result.message || (result.restart_required ? '已保存，需要重启服务后生效' : '已保存'))
+        + (warnings.length ? '；高风险豁免：' + warnings.join('；') : '');
       setRestartRequired(!!result.restart_required, 'MCP 鉴权设置已保存');
     } else {
       msg.style.color = 'var(--negative)';
@@ -8613,6 +9060,9 @@ function renderMigrateParsed(d) {
   let infoHtml = d.integrity_verified
     ? `<span style="color:var(--positive)">${_SV.ok} 备份清单与 SHA-256 校验通过。</span> `
     : `<span style="color:var(--negative)">${_SV.warn} ${esc(d.integrity_warning || '旧版备份没有完整性清单，无法确认是否齐全。')}</span> `;
+  if (d.integrity_verified && d.integrity_warning) {
+    infoHtml += `<span style="color:var(--negative)">${_SV.warn} ${esc(d.integrity_warning)}</span> `;
+  }
   infoHtml += `解析到 <strong>${Number(d.total_buckets || 0)}</strong> 个 bucket。`;
   if (hasEmb) {
     if (embMatch) {
@@ -8770,6 +9220,8 @@ async function loadDuplicates() {
 // ========================================
 function renderEditForm(bid, meta) {
   const curContent = esc(meta._content_for_edit || '');
+  const fallbackTitle = String(meta.name || '').replace(/^\d{4}-\d{2}-\d{2} \d{2}-\d{2}-\d{2}\s*/, '');
+  const editTitle = String(meta.title || fallbackTitle || '');
   const safeImportance = Math.round(safeNumber(meta.importance, 5, 1, 10));
   const editableTypes = ['dynamic','permanent','feel','plan','letter'];
   const currentType = String(meta.type || 'dynamic');
@@ -8784,7 +9236,9 @@ function renderEditForm(bid, meta) {
     <details id="bucket-edit-form" style="margin-top:14px;border:1px solid var(--border);border-radius:2px;padding:12px 14px;background:var(--surface-solid);">
       <summary style="cursor:pointer;font-weight:600;color:var(--accent);display:flex;align-items:center;gap:5px;"><svg class="icon" aria-hidden="true"><use href="#i-edit"></use></svg> 编辑这条记忆</summary>
       <div style="display:grid;grid-template-columns:90px 1fr;gap:10px 12px;align-items:center;margin-top:14px;font-size:13px;">
-        <label>名称</label>
+        <label>标题</label>
+        <input id="edit-title" type="text" maxlength="120" value="${escAttr(editTitle)}" data-dirty="0" oninput="this.dataset.dirty='1'" placeholder="原文核对使用的精确标题" />
+        <label>显示名称</label>
         <input id="edit-name" type="text" value="${escAttr(meta.name || '')}" />
         <label>类型</label>
         <select id="edit-type" style="width:160px;" onchange="syncEditPinConstraints('type')" ${typeIsEditable ? '' : 'disabled title="特殊类型由对应工具维护，编辑其他字段时会保持原类型"'}>
@@ -8864,6 +9318,7 @@ async function bucketSaveEdit(bid) {
   // iter 1.8: 新增 why_remembered / dont_surface / weight，plan 才会有 weight
   const weightEl = document.getElementById('edit-weight');
   const typeEl = document.getElementById('edit-type');
+  const titleEl = document.getElementById('edit-title');
   const body = {
     name: document.getElementById('edit-name').value,
     tags: document.getElementById('edit-tags').value,
@@ -8875,6 +9330,9 @@ async function bucketSaveEdit(bid) {
     dont_surface: document.getElementById('edit-dont-surface').checked,
     why_remembered: document.getElementById('edit-why').value,
   };
+  // 历史桶可能没有显式 title；表单展示的是 name fallback。只有用户
+  // 真正动过标题输入框才提交，避免保存其他字段时意外固化或因空标题 400。
+  if (titleEl && titleEl.dataset.dirty === '1') body.title = titleEl.value;
   // i/self、archived 及未来特殊类型由专用生命周期维护；不要把浏览器
   // select 的默认首项 dynamic 写回。普通类型仍允许沿用现有编辑入口。
   if (typeEl && !typeEl.disabled) body.type = typeEl.value;
@@ -9061,18 +9519,24 @@ async function loadLetters() {
 }
 
 function _renderLetter(l) {
-  // 用户侧显示 user_name；AI 侧（及任意自定义署名）原样显示存储的 author 值。
-  const who = l.author === 'user' ? (l.user_name || 'user') : (l.author || 'AI');
+  const who = l.writer_name || (l.author === 'user' ? (l.user_name || l.author) : l.author);
   const accentColor = l.author !== 'user' ? 'var(--accent)' : 'var(--text-dim)';
+  const lockLabel = l.lock_type === 'timed'
+    ? `定时锁${l.unlock_date ? ' · ' + esc(String(l.unlock_date).replace('T', ' ').slice(0, 16)) + ' 解锁' : ''}`
+    : (l.lock_type === 'permanent' ? '永久锁 · 当前不可查看' : '立即可读');
   return `<article style="background:var(--surface);border:1px solid var(--border);border-radius:2px;padding:18px 22px;box-shadow:4px 4px 10px var(--shadow-dark-subtle), -4px -4px 10px var(--shadow-light);" data-id="${escAttr(l.id)}">
     <div style="font-size:11px;color:var(--text-dim);letter-spacing:0.15em;display:flex;justify-content:space-between;margin-bottom:8px;">
       <span style="color:${accentColor};font-weight:600;">${esc(who)}</span><span>${esc(l.date || '')}</span>
     </div>
-    ${l.title ? `<div style="font-family:'Cormorant Garamond', serif;font-size:17px;font-weight:600;margin-bottom:8px;color:var(--text);">${esc(l.title)}</div>` : ''}
-    <div style="white-space:pre-wrap;font-size:14px;line-height:1.75;color:var(--text);">${esc(l.content || '')}</div>
+    <div style="font-size:11px;color:${l.locked ? 'var(--accent)' : 'var(--text-dim)'};margin-bottom:8px;">${lockLabel}</div>
+    ${l.deletion_request && l.deletion_request.status === 'pending' ? `<div style="font-size:12px;color:var(--negative);margin-bottom:8px;">删除申请待决定 / Deletion pending: ${esc(l.deletion_request.human_reason || '')}</div>` : ''}
+    ${l.deletion_request && l.deletion_request.status === 'rejected' ? `<div style="font-size:12px;color:var(--accent);margin-bottom:8px;">删除申请被拒绝 / Rejected${l.deletion_request.ai_reason ? ': ' + esc(l.deletion_request.ai_reason) : ''}</div>` : ''}
+    ${l.locked ? '<div style="font-size:13px;color:var(--text-dim);padding:10px 0;">这封信尚未向你开放。</div>' : `${l.title ? `<div style="font-family:'Cormorant Garamond', serif;font-size:17px;font-weight:600;margin-bottom:8px;color:var(--text);">${esc(l.title)}</div>` : ''}<div style="white-space:pre-wrap;font-size:14px;line-height:1.75;color:var(--text);">${esc(l.content || '')}</div>`}
     <div style="margin-top:12px;display:flex;gap:8px;justify-content:flex-end;font-size:11px;">
-      <button data-letter-id="${escAttr(l.id)}" onclick="editLetter(this.dataset.letterId)" title="编辑" style="padding:4px 9px;background:transparent;border:1px solid var(--border);color:var(--text-dim);border-radius:2px;cursor:pointer;display:inline-flex;align-items:center;"><i data-lucide="pencil" style="width:13px;height:13px;"></i></button>
-      <button data-letter-id="${escAttr(l.id)}" onclick="deleteLetter(this.dataset.letterId)" title="删除" style="padding:4px 9px;background:transparent;border:1px solid var(--border);color:var(--accent);border-radius:2px;cursor:pointer;display:inline-flex;align-items:center;"><i data-lucide="trash-2" style="width:13px;height:13px;"></i></button>
+      ${!l.locked ? `<button data-letter-id="${escAttr(l.id)}" onclick="editLetter(this.dataset.letterId)" title="编辑" style="padding:4px 9px;background:transparent;border:1px solid var(--border);color:var(--text-dim);border-radius:2px;cursor:pointer;display:inline-flex;align-items:center;"><i data-lucide="pencil" style="width:13px;height:13px;"></i></button>` : ''}
+      ${l.lock_owner ? `<button data-letter-id="${escAttr(l.id)}" onclick="manageLetterLock(this.dataset.letterId)" title="修改锁状态" style="padding:4px 9px;background:transparent;border:1px solid var(--border);color:var(--text-dim);border-radius:2px;cursor:pointer;display:inline-flex;align-items:center;gap:4px;"><i data-lucide="lock-keyhole" style="width:13px;height:13px;"></i> 锁</button>` : ''}
+      ${l.lock_upgrade_available ? `<button data-letter-id="${escAttr(l.id)}" onclick="convertLegacyLetter(this.dataset.letterId)" title="转换为 AI 可管理锁的新格式" style="padding:4px 9px;background:transparent;border:1px solid var(--border);color:var(--text-dim);border-radius:2px;cursor:pointer;display:inline-flex;align-items:center;gap:4px;"><i data-lucide="refresh-cw" style="width:13px;height:13px;"></i> 转换</button>` : ''}
+      ${l.deletion_request && l.deletion_request.status === 'pending' ? `<button data-letter-id="${escAttr(l.id)}" onclick="withdrawLetterDeletion(this.dataset.letterId)" title="撤回删除申请">撤回 / Withdraw</button>` : `<button data-letter-id="${escAttr(l.id)}" onclick="deleteLetter(this.dataset.letterId)" title="删除" style="padding:4px 9px;background:transparent;border:1px solid var(--border);color:var(--accent);border-radius:2px;cursor:pointer;display:inline-flex;align-items:center;"><i data-lucide="trash-2" style="width:13px;height:13px;"></i></button>`}
     </div>
   </article>`;
 }
@@ -9087,7 +9551,16 @@ async function sendLetter() {
     title: document.getElementById('letter-title').value,
     date: document.getElementById('letter-date').value,
     content: document.getElementById('letter-content').value,
+    lock_type: document.getElementById('letter-lock-type').value,
   };
+  if (body.lock_type === 'timed') {
+    const rawUnlock = document.getElementById('letter-unlock-date').value;
+    if (!rawUnlock) {
+      status.style.color = 'var(--negative)'; status.textContent = '请选择解锁时间';
+      return;
+    }
+    body.unlock_date = new Date(rawUnlock).toISOString();
+  }
   if (!body.content.trim()) {
     status.style.color = 'var(--negative)'; status.textContent = '内容为空';
     return;
@@ -9103,6 +9576,9 @@ async function sendLetter() {
       status.innerHTML = _SV.ok + ' 已寄出 · ' + esc(d.id);
       document.getElementById('letter-content').value = '';
       document.getElementById('letter-title').value = '';
+      document.getElementById('letter-lock-type').value = 'none';
+      document.getElementById('letter-unlock-date').value = '';
+      toggleLetterUnlockInput();
       loadLetters();
     } else {
       status.style.color = 'var(--negative)';
@@ -9116,7 +9592,7 @@ async function sendLetter() {
 
 async function editLetter(id) {
   const l = _lettersCache.find(x => x.id === id);
-  if (!l) { alert('未找到该信件 / Letter not found'); return; }
+  if (!l || l.locked) { alert('这封信当前不可编辑 / Letter unavailable'); return; }
   const newTitle = prompt('标题（留空则不改）：', l.title || '');
   if (newTitle === null) return;
   const newDate = prompt('日期 YYYY-MM-DD（留空则不改）：', l.date || '');
@@ -9140,15 +9616,49 @@ async function editLetter(id) {
   } catch (e) { alert(e.message); }
 }
 
-async function deleteLetter(id) {
-  if (!confirm('这会把这封信移入删除档案；文件仍保留在 archive/ 中。继续？\n\nThis moves the letter to the delete archive; the file stays in archive/. Continue?')) return;
-  if (!confirm('再次确认：这不是物理抹除。 / Confirm again: this is not a physical erase.')) return;
+async function manageLetterLock(id) {
+  const l = _lettersCache.find(x => x.id === id);
+  if (!l) { alert('未找到该信件 / Letter not found'); return; }
+  const next = prompt('新的锁状态：none / timed / permanent', l.lock_type || 'none');
+  if (next === null) return;
+  const lockType = next.trim().toLowerCase();
+  if (!['none', 'timed', 'permanent'].includes(lockType)) { alert('锁状态无效'); return; }
+  const body = {lock_type: lockType};
+  if (lockType === 'timed') {
+    const raw = prompt('解锁时间（带时区的 ISO 8601，例如 2026-08-12T20:00:00+08:00）：', l.unlock_date || '');
+    if (raw === null) return;
+    body.unlock_date = raw.trim();
+  }
+  if (!confirm('确认只修改这封信的锁状态？原稿不会改变。')) return;
   try {
-    const r = await fetch(BASE + '/api/letter/' + encodeURIComponent(id) + '?confirm=true', { method: 'DELETE' });
+    const r = await fetch(BASE + '/api/letter/' + encodeURIComponent(id), {
+      method: 'PATCH', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(body),
+    });
     const d = await r.json();
-    if (d.ok) { alert('已删除到档案 / Moved to archive'); loadLetters(); }
+    if (d.ok) { alert('已更新 / Updated'); loadLetters(); }
+    else { alert(d.error || '更新失败'); }
+  } catch (e) { alert(e.message); }
+}
+
+async function deleteLetter(id) {
+  const reason = prompt('为什么要删除这封信？必须填写理由。 / Why should this letter be deleted?');
+  if (reason === null) return;
+  if (!reason.trim()) { alert('必须填写删除理由。 / Deletion reason is required.'); return; }
+  try {
+    const r = await fetch(BASE + '/api/letter/' + encodeURIComponent(id) + '?confirm=true', { method: 'DELETE', headers: {'Content-Type':'application/json'}, body: JSON.stringify({reason}) });
+    const d = await r.json();
+    if (d.ok) { alert(d.deleted ? '已移入档案 / Moved to archive' : '删除申请已提交 / Deletion request submitted'); loadLetters(); }
     else { alert(d.error || '删除失败'); }
   } catch (e) { alert(e.message); }
+}
+
+async function withdrawLetterDeletion(id) {
+  try {
+    const r = await fetch(BASE + '/api/bucket/' + encodeURIComponent(id) + '/deletion-request/withdraw', {method:'POST'});
+    if (!r.ok) throw new Error(await r.text());
+    loadLetters();
+  } catch (e) { alert('撤回失败 / Withdrawal failed: ' + e.message); }
 }
 
 // ── E/F 级错误自动弹窗 ────────────────────────────────────────
@@ -9223,6 +9733,43 @@ function refreshAuthenticatedActiveView() {
   if (!target) target = document.querySelector('.tab.active');
   if (target) return activateDashboardTab(target);
   return Promise.resolve([]);
+}
+
+async function convertLegacyLetter(id) {
+  const l = _lettersCache.find(x => x.id === id);
+  if (!l || !l.lock_upgrade_available) { alert('这封信不需要转换 / Conversion unavailable'); return; }
+  if (!confirm('转换后，这封历史 Letter 的锁控制权将永久交给当前 AI。\n\n正文、标题和创建时间不会改变；当前仍保持公开。确认继续？')) return;
+  await _submitConvertLegacyLetter(id, '');
+}
+
+// AI_NAME 未配置时后端会拒绝转换（需要一个「实际关系名」才能确定锁的归属，
+// 见 web/letters.py 的 convert_to_lockable 分支）。这里不改那道检查，只是让
+// 用户能当场填一个名字重试——只用于这一次转换请求，不写入全局配置。
+async function _submitConvertLegacyLetter(id, aiName) {
+  try {
+    const body = {convert_to_lockable: true};
+    if (aiName) body.ai_name = aiName;
+    const r = await fetch(BASE + '/api/letter/' + encodeURIComponent(id), {
+      method: 'PATCH', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(body),
+    });
+    const d = await r.json();
+    if (d.ok) { alert('已转换为新版 Letter，锁控制权已交给当前 AI。'); loadLetters(); return; }
+    if (!aiName && r.status === 400 && (d.error || '').indexOf('无法转换历史 Letter') === 0) {
+      const typed = (prompt(
+        '当前未配置 AI_NAME，无法确定这封信锁的实际归属名。\n\n'
+        + '请输入这次转换要用的实际关系名（仅用于这一次转换，不会修改全局配置）：'
+      ) || '').trim();
+      if (typed) { await _submitConvertLegacyLetter(id, typed); return; }
+      return;
+    }
+    alert(d.error || '转换失败');
+  } catch (e) { alert(e.message); }
+}
+
+function toggleLetterUnlockInput() {
+  const type = document.getElementById('letter-lock-type').value;
+  document.getElementById('letter-unlock-date').style.display = type === 'timed' ? '' : 'none';
 }
 
 // ── 给作者反馈 ──────────────────────────────────────────────

@@ -379,7 +379,6 @@ async def test_concurrent_initial_setup_creates_exactly_one_session(monkeypatch)
 
     monkeypatch.setattr(auth_web.sh, "_save_password_hash", save_password)
     monkeypatch.setattr(auth_web.sh, "_sessions", sessions)
-    monkeypatch.setattr(auth_web.sh, "_save_sessions", lambda: None)
     monkeypatch.setattr(auth_web.sh, "_revoke_all_sessions", sessions.clear)
     monkeypatch.setattr(auth_web.sh, "_create_session", create_session)
     monkeypatch.setattr(
@@ -490,6 +489,150 @@ async def test_native_gemini_calls_keep_api_keys_out_of_urls(monkeypatch, tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_openai_compat_passes_configured_extra_body(tmp_path):
+    dehydrator = Dehydrator(
+        {
+            "buckets_dir": str(tmp_path),
+            "dehydration": {
+                "api_key": "test-key",
+                "model": "deepseek-v4-flash",
+                "extra_body": {"thinking": {"type": "disabled"}},
+            },
+        }
+    )
+    captured = {}
+
+    class Completions:
+        async def create(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="OK"))]
+            )
+
+    dehydrator.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=Completions())
+    )
+    try:
+        result = await dehydrator._chat_once("system", "user")
+    finally:
+        dehydrator.close()
+
+    assert result == "OK"
+    assert captured["extra_body"] == {"thinking": {"type": "disabled"}}
+
+
+@pytest.mark.parametrize(
+    ("model", "expected_limit_key"),
+    [
+        ("gpt-5", "max_completion_tokens"),
+        ("openai/gpt-5-mini", "max_completion_tokens"),
+        ("models/gpt-5.1", "max_completion_tokens"),
+        ("gpt-50x", "max_tokens"),
+        ("deepseek-v4-flash", "max_tokens"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_openai_compat_uses_model_specific_completion_limit(
+    tmp_path,
+    model,
+    expected_limit_key,
+):
+    dehydrator = Dehydrator(
+        {
+            "buckets_dir": str(tmp_path),
+            "dehydration": {"api_key": "test-key", "model": model},
+        }
+    )
+    captured = {}
+
+    class Completions:
+        async def create(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="OK"))]
+            )
+
+    dehydrator.client = SimpleNamespace(
+        chat=SimpleNamespace(completions=Completions())
+    )
+    try:
+        result = await dehydrator._chat_once("system", "user", max_tokens=7)
+    finally:
+        dehydrator.close()
+
+    other_limit_key = (
+        "max_tokens"
+        if expected_limit_key == "max_completion_tokens"
+        else "max_completion_tokens"
+    )
+    assert result == "OK"
+    assert captured[expected_limit_key] == 7
+    assert other_limit_key not in captured
+
+
+@pytest.mark.parametrize(
+    ("model", "expected_limit_key"),
+    [
+        ("azure/gpt-5.1", "max_completion_tokens"),
+        ("gpt-4o-mini", "max_tokens"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_dehydration_probe_uses_model_specific_completion_limit(
+    monkeypatch,
+    model,
+    expected_limit_key,
+):
+    calls = []
+
+    class Response:
+        status_code = 200
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, url, **kwargs):
+            calls.append((url, kwargs))
+            return Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", Client)
+    monkeypatch.setattr(config_api_web.sh, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(
+        config_api_web.sh,
+        "config",
+        {
+            "dehydration": {
+                "api_key": "probe-key",
+                "base_url": "https://provider.example/v1",
+                "model": model,
+            }
+        },
+    )
+    mcp = FakeMCP()
+    config_api_web.register(mcp)
+
+    response = await mcp.routes[("POST", "/api/test/dehydration")](object())
+
+    other_limit_key = (
+        "max_tokens"
+        if expected_limit_key == "max_completion_tokens"
+        else "max_completion_tokens"
+    )
+    assert response.status_code == 200
+    [(url, kwargs)] = calls
+    assert url == "https://provider.example/v1/chat/completions"
+    assert kwargs["json"][expected_limit_key] == 5
+    assert other_limit_key not in kwargs["json"]
+
+
+@pytest.mark.asyncio
 async def test_gemini_model_catalog_keeps_api_key_out_of_query(monkeypatch):
     calls = []
 
@@ -581,6 +724,202 @@ async def test_webhook_failure_log_does_not_expose_signed_url(monkeypatch):
     assert "secret-query" not in combined
 
 
+def test_mcp_operation_logs_never_copy_text_or_control_sequences():
+    import server as server_mod
+
+    secret = "private query\r\n\t\x1b[31mFAKE-ERROR"
+    rendered = server_mod._fmt_log_args(
+        {"query": secret, "author": "Alice", "max_results": 3}
+    )
+
+    assert "private" not in rendered
+    assert "Alice" not in rendered
+    assert "FAKE-ERROR" not in rendered
+    assert "\r" not in rendered
+    assert "\n" not in rendered
+    assert "\x1b" not in rendered
+    assert f"query=str_len:{len(secret)}" in rendered
+    assert "author=str_len:5" in rendered
+    assert "max_results=3" in rendered
+
+
+@pytest.mark.asyncio
+async def test_mcp_error_response_never_includes_another_calls_log_tail(monkeypatch):
+    import errors as errors_mod
+    import server as server_mod
+
+    monkeypatch.setattr(
+        errors_mod,
+        "get_recent_logs",
+        lambda _limit: ["prior-client-private-query"],
+    )
+
+    async def fail():
+        raise RuntimeError("current failure\r\n\x1b[31mforged")
+
+    result = await server_mod._with_notice(fail(), op="security_probe")
+
+    assert "prior-client-private-query" not in result
+    assert "--- 最近" not in result
+    assert "RuntimeError" in result
+    assert "异常正文已隐藏" in result
+    assert "current failure" not in result
+    assert "forged" not in result
+    assert "\\x0d" not in result
+    assert "\x1b" not in result
+
+
+@pytest.mark.asyncio
+async def test_mcp_error_fallback_still_sanitizes_exception_text(monkeypatch):
+    import server as server_mod
+
+    monkeypatch.setattr(
+        server_mod,
+        "format_error",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("formatter down")),
+    )
+
+    async def fail():
+        raise RuntimeError("https://provider.invalid/?key=secret\r\n\x1b[31mforged")
+
+    result = await server_mod._with_notice(fail(), op="security_probe")
+
+    assert "RuntimeError" in result
+    assert "异常正文已隐藏" in result
+    assert "https://" not in result
+    assert "provider.invalid" not in result
+    assert "secret" not in result
+    assert "forged" not in result
+    assert "\\x0d" not in result
+    assert "\r" not in result
+    assert "\n\x1b" not in result
+    assert "\x1b" not in result
+
+
+@pytest.mark.asyncio
+async def test_mcp_public_tool_error_returns_only_reviewed_static_message():
+    import server as server_mod
+    from errors import PublicToolError
+
+    safe_message = (
+        "API key 未配置或调用失败，日记拆分无法完成，桶未创建。"
+        "请检查 OMBRE_COMPRESS_API_KEY。"
+    )
+
+    async def fail():
+        try:
+            raise RuntimeError("provider-secret-key https://provider.invalid/private")
+        except RuntimeError as provider_error:
+            raise PublicToolError(safe_message) from provider_error
+
+    result = await server_mod._with_notice(fail(), op="grow")
+
+    assert safe_message in result
+    assert "provider-secret-key" not in result
+    assert "provider.invalid" not in result
+
+
+@pytest.mark.parametrize(
+    "message",
+    ("", "line one\nline two", "control\x1btext", "x" * 501),
+)
+def test_public_tool_error_rejects_unsafe_public_messages(message):
+    from errors import PublicToolError
+
+    with pytest.raises(ValueError):
+        PublicToolError(message)
+
+
+@pytest.mark.asyncio
+async def test_mcp_exception_secrets_never_reach_response_persistence_or_logs(
+    monkeypatch, tmp_path
+):
+    import errors as errors_mod
+    import server as server_mod
+
+    error_path = tmp_path / "errors.jsonl"
+    log_messages = []
+
+    class CapturingLogger:
+        @staticmethod
+        def _render(message, args):
+            return (message % args) if args else str(message)
+
+        def info(self, message, *args, **_kwargs):
+            log_messages.append(self._render(message, args))
+
+        def error(self, message, *args, **_kwargs):
+            log_messages.append(self._render(message, args))
+
+        def exception(self, *_args, **_kwargs):
+            raise AssertionError("异常路径不得记录 traceback")
+
+    logger = CapturingLogger()
+    monkeypatch.setattr(errors_mod, "_errors_path", str(error_path))
+    monkeypatch.setattr(errors_mod, "logger", logger)
+    monkeypatch.setattr(server_mod, "logger", logger)
+
+    async def fail():
+        raise RuntimeError(
+            "https://provider.invalid/private?api_key=super-secret-token "
+            "C:\\Users\\Alice\\.env /home/alice/.ssh/id_rsa\r\n"
+            "\x1b[31mFORGED-LOG"
+        )
+
+    response = await server_mod._with_notice(fail(), op="security_probe")
+    persisted = error_path.read_text(encoding="utf-8")
+    logs = "\n".join(log_messages)
+
+    assert "RuntimeError" in response
+    assert "异常正文已隐藏" in response
+    for rendered in (response, persisted, logs):
+        assert "https://" not in rendered
+        assert "provider.invalid" not in rendered
+        assert "super-secret-token" not in rendered
+        assert "C:\\Users\\Alice" not in rendered
+        assert "/home/alice/.ssh" not in rendered
+        assert "FORGED-LOG" not in rendered
+        assert "\x1b" not in rendered
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    (
+        "breath",
+        "breath_search",
+        "breath_advanced",
+        "hold",
+        "grow",
+        "trace",
+        "dream",
+        "anchor",
+        "release",
+        "pulse",
+        "plan",
+        "letter_write",
+        "letter_lock_update",
+        "letter_read",
+        "I",
+    ),
+)
+def test_all_public_mcp_argument_models_forbid_unknown_fields(tool_name):
+    """所有公开工具都必须拒绝未知参数，不论它挂在哪个连接器。
+
+    Pydantic 默认的 extra=ignore 会让拼错的参数看似调用成功——写工具甚至会在
+    未应用目标字段的情况下仍然创建记忆。信件自 3.2.0 起挂在 /mcp-extra，
+    这条边界必须跟着工具一起走过去。
+    """
+    import server as server_mod
+
+    # 工具可能注册在主连接器或 /mcp-extra 上，两处都算公开面
+    public_tool = server_mod.mcp._tool_manager.get_tool(
+        tool_name
+    ) or server_mod.mcp_extra._tool_manager.get_tool(tool_name)
+
+    assert public_tool is not None, f"{tool_name} 在两个连接器上都找不到"
+    assert public_tool.fn_metadata.arg_model.model_config.get("extra") == "forbid"
+
+
 @pytest.mark.asyncio
 async def test_chunked_multipart_raw_stream_is_bounded_before_form_result():
     class ChunkedRequest:
@@ -623,3 +962,48 @@ async def test_chunked_multipart_raw_stream_is_bounded_before_form_result():
 
     assert request.received == 2
     assert request._receive is request.original_receive
+
+
+def test_safe_error_detail_redacts_credential_forms():
+    """异常正文可以给出去，但三类常见凭证形态必须先抹掉。"""
+    from errors import safe_error_detail
+
+    detail = safe_error_detail(
+        RuntimeError(
+            "call failed: Authorization: Bearer abc123secret, "
+            "api_key=sk-livesecretvalue123456 at https://provider.invalid"
+        )
+    )
+
+    assert "abc123secret" not in detail
+    assert "sk-livesecretvalue123456" not in detail
+    assert "[REDACTED]" in detail
+    # 非凭证信息要保留，否则脱敏就等于把排查线索一起删了
+    assert "call failed" in detail
+
+
+def test_safe_error_detail_falls_back_and_bounds_length():
+    """空正文回落到异常类名；超长正文截断，避免把整页 traceback 塞给客户端。"""
+    from errors import safe_error_detail
+
+    assert safe_error_detail(RuntimeError("")) == "RuntimeError"
+    assert len(safe_error_detail(RuntimeError("x" * 5000))) <= 200
+
+
+@pytest.mark.asyncio
+async def test_tool_return_redacts_credentials_on_broad_failure(monkeypatch):
+    """工具层 broad-except 的回传不得把凭证原样送到 MCP 客户端。"""
+    import tools._runtime as rt
+    from tools.breath.catalog import surface_catalog
+
+    class ExplodingBucketMgr:
+        async def list_all(self, include_archive=False):
+            raise RuntimeError("disk backend rejected api_key=sk-livesecretvalue123456")
+
+    monkeypatch.setattr(rt, "bucket_mgr", ExplodingBucketMgr(), raising=False)
+
+    result = await surface_catalog()
+
+    assert "sk-livesecretvalue123456" not in result
+    assert "[REDACTED]" in result
+    assert "获取记忆目录失败" in result

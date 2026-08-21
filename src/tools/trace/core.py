@@ -12,7 +12,8 @@ trace 是 OB 唯一的「写元数据」入口，承接所有桶字段更新和�
   必须同时提供非空 delete_reason，普通记忆和 plan 均拒绝且保持原位
 - 收集传入字段构造 updates dict（含 status/weight/dont_surface/
   why_remembered/pinned/digested/resolved/content/tags/domain 等）
-- pinned=1 时强制 importance=10 并做配额检查；pinned=0 仅取消标记
+- pinned=1 时强制 importance=10 并做配额检查；pinned=0 必须在
+  同一次调用显式传入 importance=1..10，原子恢复动态评分
 - content 改写时同步重建 embedding，并对 plan 桶追加 change_log
 - resolved/digested 切换会附中文语义提示
 
@@ -22,7 +23,7 @@ trace 是 OB 唯一的「写元数据」入口，承接所有桶字段更新和�
 - 不返回结构化数据，统一中文短句
 
 对外暴露：trace_core(bucket_id, name, domain, valence, arousal, importance,
-                     tags, resolved, pinned, digested, content, delete,
+                     tags, resolved, pinned, protected, digested, content, delete,
                      status, weight, dont_surface, why_remembered,
                      meaning_append, meaning_replace, media_append, media_replace,
                      hard_delete, delete_reason, restore, old_str, new_str) → str
@@ -37,14 +38,13 @@ from ombrebrain.domain.memory_messages import resolved_hint
 from utils import parse_bool
 from .. import _runtime as rt
 from .._common import (
-    _HIGH_IMP_THRESHOLD,
     _quota_turn,
     check_content_size,
     check_metadata_size,
     check_pinned_quota,
-    enforce_high_importance_quota,
-    occupies_high_importance_quota_slot,
+    check_protected_quota,
 )
+from ..plan.core import is_letter_bucket, letter_lock_revision, letter_lock_state
 
 
 async def trace_core(
@@ -57,6 +57,7 @@ async def trace_core(
     tags: Optional[str] = "",
     resolved: Optional[int] = -1,
     pinned: Optional[int] = -1,
+    protected: Optional[int] = -1,
     digested: Optional[int] = -1,
     content: Optional[str] = "",
     delete: Optional[bool] = False,
@@ -91,6 +92,8 @@ async def trace_core(
         resolved = -1
     if pinned is None:
         pinned = -1
+    if protected is None:
+        protected = -1
     if digested is None:
         digested = -1
     if content is None:
@@ -143,8 +146,11 @@ async def trace_core(
     importance = _safe_int(importance, -1)
     resolved = _safe_int(resolved, -1)
     pinned = _safe_int(pinned, -1)
+    protected = _safe_int(protected, -1)
     digested = _safe_int(digested, -1)
     dont_surface = _safe_int(dont_surface, -1)
+    if protected not in (-1, 0, 1):
+        return "protected 只能传 -1、0 或 1；本次未修改。"
 
     metadata_err = check_metadata_size(
         bucket_id=bucket_id,
@@ -170,6 +176,7 @@ async def trace_core(
         "tags": tags,
         "resolved": resolved,
         "pinned": pinned,
+        "protected": protected,
         "digested": digested,
         "content_length": len(content or ""),
         "delete": delete,
@@ -187,6 +194,28 @@ async def trace_core(
     if not bucket_id or not bucket_id.strip():
         return "请提供有效的 bucket_id。"
 
+    if restore or delete or hard_delete:
+        guarded_reader = (
+            getattr(rt.bucket_mgr, "get_including_archive", None)
+            if restore else None
+        )
+        if not callable(guarded_reader):
+            guarded_reader = rt.bucket_mgr.get
+        guarded_bucket = await guarded_reader(bucket_id)
+        if (
+            guarded_bucket
+            and is_letter_bucket(guarded_bucket)
+            and letter_lock_state(guarded_bucket, "ai")["locked"]
+        ):
+            return "这封信尚未向你开放，不能通过 trace 修改其生命周期。"
+
+    restore_unprotect = bool(restore and protected == 0)
+    if restore_unprotect and not (1 <= importance <= 10):
+        return (
+            "恢复归档桶时解除 protected，必须在同一次 trace 中显式传入 "
+            "importance=1..10；本次未恢复、未修改。"
+        )
+
     restore_conflicts = any((
         delete,
         hard_delete,
@@ -194,10 +223,11 @@ async def trace_core(
         bool(domain),
         valence != -1,
         arousal != -1,
-        importance != -1,
+        importance != -1 and not restore_unprotect,
         bool(tags),
         resolved != -1,
         pinned != -1,
+        protected != -1 and not restore_unprotect,
         digested != -1,
         bool(content),
         bool(status),
@@ -215,16 +245,134 @@ async def trace_core(
     if restore and restore_conflicts:
         return (
             "参数冲突：restore=True 必须单独调用，不能同时删除或修改记忆；"
+            "唯一例外是用 protected=0 与 importance=1..10 原子解除归档保护。"
             "本次未恢复、未修改。"
         )
     if restore:
-        result = await rt.bucket_mgr.restore_archived(bucket_id)
+        if not guarded_bucket:
+            return f"未找到记忆桶: {bucket_id}"
+        restore_meta = guarded_bucket.get("metadata", {})
+        if not isinstance(restore_meta, dict):
+            restore_meta = {}
+        restore_is_terminal = bool(
+            str(restore_meta.get("type") or "").strip().lower() == "archived"
+            or restore_meta.get("deleted_at")
+            or parse_bool(restore_meta.get("tombstone"), default=False)
+        )
+        if not restore_is_terminal:
+            return f"记忆桶仍在日常记忆中，无需恢复: {bucket_id}"
+
+        restore_pinned = parse_bool(
+            restore_meta.get("pinned"), default=False
+        )
+        restore_protected = parse_bool(
+            restore_meta.get("protected"), default=False
+        )
+        restore_anchor = parse_bool(
+            restore_meta.get("anchor"), default=False
+        )
+        if restore_unprotect and not restore_protected:
+            return (
+                f"归档记忆桶 {bucket_id} 当前不是 protected；"
+                "请单独使用 restore=True 恢复。本次未恢复、未修改。"
+            )
+        if restore_protected and restore_anchor and not restore_unprotect:
+            return (
+                f"归档记忆桶 {bucket_id} 同时带有 protected 与 anchor，"
+                "不能恢复为冲突的活跃状态。请调用 "
+                "trace(bucket_id, restore=True, protected=0, "
+                "importance=1..10) 原子解除保护并恢复。"
+            )
+        final_restore_protected = restore_protected and not restore_unprotect
+        try:
+            restored_type = rt.bucket_mgr.footprint_snapshot().original_kind(
+                bucket_id, dict(restore_meta)
+            )
+        except Exception:
+            restored_type = "dynamic"
+        if restored_type not in {
+            "dynamic", "permanent", "feel", "plan", "letter", "i", "self",
+        }:
+            restored_type = "dynamic"
+        if restore_pinned:
+            restored_type = "permanent"
+
+        restored_importance = _safe_int(
+            restore_meta.get("importance"), 0
+        )
+        restored_target_importance = (
+            int(importance)
+            if restore_unprotect
+            else (10 if final_restore_protected else restored_importance)
+        )
+        restore_snapshot = (
+            restore_pinned,
+            restore_protected,
+            restore_anchor,
+            str(restore_meta.get("type") or "").strip().lower(),
+            restored_importance,
+            parse_bool(restore_meta.get("dont_surface"), default=False),
+            str(restore_meta.get("deleted_at") or ""),
+            parse_bool(restore_meta.get("tombstone"), default=False),
+        )
+        importance_override = (
+            restored_target_importance if restore_unprotect else None
+        )
+        async with AsyncExitStack() as restore_stack:
+            if final_restore_protected:
+                await restore_stack.enter_async_context(
+                    _quota_turn("protected")
+                )
+
+            locked_reader = getattr(
+                rt.bucket_mgr, "get_including_archive", None
+            )
+            if not callable(locked_reader):
+                locked_reader = rt.bucket_mgr.get
+            locked_bucket = await locked_reader(bucket_id)
+            if not locked_bucket:
+                return f"未找到记忆桶: {bucket_id}"
+            locked_meta = locked_bucket.get("metadata", {})
+            if not isinstance(locked_meta, dict):
+                locked_meta = {}
+            locked_restore_snapshot = (
+                parse_bool(locked_meta.get("pinned"), default=False),
+                parse_bool(locked_meta.get("protected"), default=False),
+                parse_bool(locked_meta.get("anchor"), default=False),
+                str(locked_meta.get("type") or "").strip().lower(),
+                _safe_int(locked_meta.get("importance"), 0),
+                parse_bool(locked_meta.get("dont_surface"), default=False),
+                str(locked_meta.get("deleted_at") or ""),
+                parse_bool(locked_meta.get("tombstone"), default=False),
+            )
+            if locked_restore_snapshot != restore_snapshot:
+                return (
+                    f"记忆桶 {bucket_id} 在恢复期间已被其他请求更新，"
+                    "为避免覆盖或配额误判，请重试。"
+                )
+
+            if final_restore_protected:
+                quota_err = await check_protected_quota()
+                if quota_err:
+                    return quota_err
+
+            result = await rt.bucket_mgr.restore_archived(
+                bucket_id,
+                importance_override=importance_override,
+                protected_override=False if restore_unprotect else None,
+            )
         if result.get("ok"):
             return f"已重新回忆并恢复记忆桶: {bucket_id}"
         if result.get("error") == "not_archived":
             return f"记忆桶仍在日常记忆中，无需恢复: {bucket_id}"
         if result.get("error") == "not_found":
             return f"未找到记忆桶: {bucket_id}"
+        if result.get("error") == "incompatible_protected_anchor":
+            return (
+                f"归档记忆桶 {bucket_id} 同时带有 protected 与 anchor，"
+                "请调用 trace(bucket_id, restore=True, protected=0, "
+                "importance=1..10) 原子解除保护并恢复。"
+            )
         return f"恢复记忆桶失败: {result.get('error', 'unknown_error')}"
 
     patch_args_supplied = bool(old_str) or new_str_provided
@@ -275,7 +423,10 @@ async def trace_core(
             return "拒绝永久删除：必须提供非空 delete_reason；本次未删除、未归档。"
         if result.get("error") == "delete_reason_too_long":
             return "拒绝永久删除：delete_reason 不能超过 500 个字符；本次未删除、未归档。"
-        return f"永久删除失败: {result.get('error', 'unknown_error')}"
+        if result.get("error") == "not_found":
+            return f"未找到记忆桶: {bucket_id}；本次未删除、未归档。"
+        # 兜底保留原始错误码便于排查，但不能只甩一个英文码给调用方。
+        return f"永久删除失败：{result.get('error', 'unknown_error')}；本次未删除、未归档。"
 
     if delete:
         success = await rt.bucket_mgr.delete(bucket_id)
@@ -287,84 +438,92 @@ async def trace_core(
 
     meta = bucket.get("metadata", {})
     current_pinned = parse_bool(meta.get("pinned"), default=False)
-    protected = parse_bool(meta.get("protected"), default=False)
-    unpinning_now = pinned == 0 and current_pinned
-    if (
-        1 <= importance <= 10
-        and (current_pinned or protected)
-        and not (unpinning_now and not protected)
-    ):
+    current_protected = parse_bool(meta.get("protected"), default=False)
+    current_anchor = parse_bool(meta.get("anchor"), default=False)
+    logical_letter = is_letter_bucket(bucket)
+    lock_precondition = (
+        {"expected_lock_state": letter_lock_revision(bucket)}
+        if logical_letter else {}
+    )
+    if logical_letter and letter_lock_state(bucket, "ai")["locked"]:
+        return "这封信尚未向你开放；请使用 Letter 专用入口管理锁状态。"
+    pin_state_changed = (
+        pinned in (0, 1) and bool(pinned) != current_pinned
+    )
+    protected_state_changed = (
+        protected in (0, 1) and bool(protected) != current_protected
+    )
+    if logical_letter and (pin_state_changed or protected_state_changed):
         return (
-            f"记忆桶 {bucket_id} 是 pinned/protected 核心桶，importance 被锁定为 10，"
-            "本次未修改。请先 trace(bucket_id, pinned=0)，再单独 trace(bucket_id, importance=...)。"
+            "Letter 不能通过 trace 改变 pinned/protected 状态；"
+            "请使用 Letter 专用入口。"
         )
 
-    # 配额判定 + 落盘必须在同一把锁里：check_pinned_quota/enforce_high_importance_quota
+    final_pinned = bool(pinned) if pinned in (0, 1) else current_pinned
+    final_protected = (
+        bool(protected)
+        if protected in (0, 1)
+        else current_protected
+    )
+    if final_pinned and final_protected:
+        return "pinned 与 protected 互斥，本次未修改。"
+    if final_protected and current_anchor:
+        return (
+            "protected 与 anchor 互斥；请先用 release() 解除 anchor，"
+            "再保护该记忆桶。本次未修改。"
+        )
+
+    leaving_last_guard = (
+        (current_pinned or current_protected)
+        and not (final_pinned or final_protected)
+    )
+    if leaving_last_guard and not (1 <= importance <= 10):
+        return (
+            f"解除记忆桶 {bucket_id} 最后一层 pinned/protected 保护时，"
+            "必须在同一次 trace "
+            "中显式传入 importance=1..10。本次未修改。"
+        )
+
+    if (
+        1 <= importance <= 10
+        and (final_pinned or final_protected)
+        and not (pin_state_changed or protected_state_changed)
+    ):
+        return (
+            f"记忆桶 {bucket_id} 是 pinned/受保护桶，importance 被锁定为 10，"
+            "本次未修改。解除最后一层保护时请在同一次"
+            "调用传入 importance=1..10。"
+        )
+
+    # 配额判定 + 落盘必须在同一把锁里：check_pinned_quota/check_protected_quota
     # 到最终 bucket_mgr.update() 之间隔着别的字段处理和一次 await，两个并发 trace()
     # 都可能在对方提交前读到同一个「未满」快照。是否需要哪把锁在动 updates 之前就
     # 能从入参判断出来，所以先算好，再把整段检查+落盘包进对应的 quota turn。
     current_importance = int(meta.get("importance") or 0)
     current_type = str(meta.get("type") or "dynamic").strip().lower()
-    pin_state_changed = pinned in (0, 1) and bool(pinned) != current_pinned
-    final_pinned = bool(pinned) if pinned in (0, 1) else current_pinned
-    final_type = current_type
-    if pinned == 1:
-        final_type = "permanent"
-    elif unpinning_now and not protected:
-        final_type = "dynamic"
+    protecting_now = final_protected and not current_protected
+    pinning_now = final_pinned and not current_pinned
     requested_importance = (
         int(importance) if 1 <= importance <= 10 else current_importance
     )
-    final_importance = 10 if pinned == 1 else requested_importance
+    final_importance = (
+        10
+        if final_pinned or final_protected
+        else requested_importance
+    )
     current_dont_surface = parse_bool(
         meta.get("dont_surface"), default=False
     )
-    final_dont_surface = (
-        bool(dont_surface)
-        if dont_surface in (0, 1)
-        else current_dont_surface
-    )
-    before_quota_meta = dict(meta)
-    before_quota_meta.update({
-        "importance": current_importance,
-        "pinned": current_pinned,
-        "protected": protected,
-        "type": current_type,
-        "dont_surface": current_dont_surface,
-    })
-    after_quota_meta = dict(before_quota_meta)
-    after_quota_meta.update({
-        "importance": final_importance,
-        "pinned": final_pinned,
-        "type": final_type,
-        "dont_surface": final_dont_surface,
-    })
-    occupied_high_before = occupies_high_importance_quota_slot(
-        before_quota_meta
-    )
-    occupies_high_after = occupies_high_importance_quota_slot(after_quota_meta)
-    reserves_high_importance = occupies_high_after and not occupied_high_before
-    eligibility_field_changed = (
-        pin_state_changed or final_dont_surface != current_dont_surface
-    )
-    importance_changed = final_importance != current_importance
-    needs_high_importance_lock = (
-        eligibility_field_changed
-        or (
-            importance_changed
-            and max(current_importance, final_importance)
-            >= _HIGH_IMP_THRESHOLD
-        )
-    )
     need_pinned_lock = pin_state_changed
+    need_protected_lock = protected_state_changed
 
     async with AsyncExitStack() as quota_stack:
         if need_pinned_lock:
             await quota_stack.enter_async_context(_quota_turn("pinned"))
-        if needs_high_importance_lock:
-            await quota_stack.enter_async_context(_quota_turn("high_importance"))
+        if need_protected_lock:
+            await quota_stack.enter_async_context(_quota_turn("protected"))
 
-        if need_pinned_lock or needs_high_importance_lock:
+        if need_pinned_lock or need_protected_lock:
             locked_bucket = await rt.bucket_mgr.get(bucket_id)
             if not locked_bucket:
                 return f"未找到记忆桶: {bucket_id}"
@@ -375,24 +534,21 @@ async def trace_core(
                 str(locked_meta.get("type") or "dynamic").strip().lower(),
                 int(locked_meta.get("importance") or 0),
                 parse_bool(locked_meta.get("dont_surface"), default=False),
+                parse_bool(locked_meta.get("anchor"), default=False),
             )
             original_snapshot = (
                 current_pinned,
-                protected,
+                current_protected,
                 current_type,
                 current_importance,
                 current_dont_surface,
+                current_anchor,
             )
             if locked_snapshot != original_snapshot:
                 return (
                     f"记忆桶 {bucket_id} 在本次修改期间已被其他请求更新，"
                     "为避免覆盖或配额误判，请重试。"
                 )
-
-        if reserves_high_importance:
-            final_importance = await enforce_high_importance_quota(
-                final_importance
-            )
 
         updates: dict = {}
         if name:
@@ -412,8 +568,16 @@ async def trace_core(
         if pinned in (0, 1):
             updates["pinned"] = bool(pinned)
             if pinned == 1:
-                if need_pinned_lock:
+                if pinning_now:
                     err = await check_pinned_quota()
+                    if err:
+                        return err
+                updates["importance"] = 10
+        if protected in (0, 1):
+            updates["protected"] = bool(protected)
+            if protected == 1:
+                if protecting_now:
+                    err = await check_protected_quota()
                     if err:
                         return err
                 updates["importance"] = 10
@@ -432,13 +596,6 @@ async def trace_core(
             updates["weight"] = float(weight)
         if dont_surface in (0, 1):
             updates["dont_surface"] = bool(dont_surface)
-        if (
-            reserves_high_importance
-            and final_importance != requested_importance
-        ):
-            # Unpinning/restoring surfacing can create an ordinary high slot.
-            # Persist quota degradation in the same bucket transaction.
-            updates["importance"] = final_importance
         why_remembered = str(why_remembered).strip()
         if why_remembered == "\\clear":
             updates["why_remembered"] = ""
@@ -468,14 +625,24 @@ async def trace_core(
             from .._common import append_plan_change_log
             old_meta = bucket.get("metadata", {})
             history = list(old_meta.get("change_log") or [])
-            if "status" in updates and updates["status"] != old_meta.get("status"):
+            old_status = old_meta.get("status") or "active"
+            if "status" in updates and updates["status"] != old_status:
                 history = append_plan_change_log(
                     history, "status",
-                    **{"from": old_meta.get("status"), "to": updates["status"]},
+                    **{
+                        "from": old_status,
+                        "to": updates["status"],
+                        "by": "trace",
+                    },
                 )
             if content_change_requested:
-                history = append_plan_change_log(history, "edit")
+                history = append_plan_change_log(history, "edit", by="trace")
             updates["change_log"] = history
+
+        if is_plan and ("status" in updates or content_change_requested):
+            # 显式状态/正文变更会让旧完成建议失效；None 由 BucketManager
+            # 解释为删除 frontmatter 字段。失败的局部替换不会进入提交路径。
+            updates["resolution_suggested"] = None
 
         if patch_args_supplied:
             patch_result = await rt.bucket_mgr.update_content_fragment(
@@ -483,6 +650,8 @@ async def trace_core(
                 old_str=old_str,
                 new_str=new_str,
                 append_plan_history=append_plan_history_in_patch,
+                event_actor="llm",
+                **lock_precondition,
                 **updates,
             )
             if not patch_result.get("ok"):
@@ -507,7 +676,12 @@ async def trace_core(
                     return "old_str 与 new_str 替换后正文没有变化；本次未修改。"
                 return f"修改失败: {bucket_id}"
         else:
-            success = await rt.bucket_mgr.update(bucket_id, **updates)
+            success = await rt.bucket_mgr.update(
+                bucket_id,
+                event_actor="llm",
+                **lock_precondition,
+                **updates,
+            )
             if not success:
                 return f"修改失败: {bucket_id}"
 
@@ -533,7 +707,10 @@ async def trace_core(
 
     _display_updates = {
         k: v for k, v in updates.items()
-        if k not in ("content", "meaning_append", "meaning", "media_append", "media")
+        if k not in (
+            "content", "meaning_append", "meaning", "media_append", "media",
+            "resolution_suggested",
+        )
     }
     changed = ", ".join(f"{k}={v}" for k, v in _display_updates.items())
     if patch_args_supplied:

@@ -20,47 +20,64 @@ transport: "stdio"
 deployment:
   public_url: ""  # e.g. "https://ob.example.com"
 
+# --- AI display name / AI 一方的显示名 ---
+# 用于 letter 署名、prompt 与面向用户的文案，避免硬编码具体模型名。
+# 留空 = 没配：此时回退到环境变量 AI_NAME，仍为空则用 "AI"。
+# 写在这里的值随 vault 一起持久化，容器重建/重启都不会丢；
+# 环境变量则依赖 compose 逐个透传，漏一个就会静默退回默认名。
+# Display name for the AI side (letter signatures, prompts, user-facing text).
+# Empty = unset: falls back to the AI_NAME env var, then to "AI".
+ai_name: ""
+
+# --- Timezone / 时区 ---
+# 用户只给日期、不写时区时（例如 Letter 定时锁的 unlock_date="2027-01-01"），
+# 按这个时区理解成当地那一天的 00:00。留空 = Asia/Shanghai（东八区）。
+# 用 IANA 时区名（Asia/Shanghai、UTC、America/New_York…）；名字非法或运行环境
+# 缺少 tzdata 时回退固定 +08:00，不会因此报错。Dashboard「设置」里可改。
+# IANA timezone name used to interpret date-only input (e.g. Letter unlock_date).
+# Empty = Asia/Shanghai. Falls back to a fixed +08:00 when unresolvable.
+timezone: "Asia/Shanghai"
+
 # --- Log level / 日志级别 ---
 log_level: "INFO"
 
 # --- MCP remote auth / MCP 远程鉴权开关 ---
-# true  (默认): HTTPS 连接 /mcp 时强制走 OAuth 2.1 + PKCE（Claude.ai 网页版需要）。
-# false: 完全跳过 OAuth，任何客户端（自有前端 / GPT / GLM / 自定义脚本）可免认证直连 /mcp。
-# 把 OB 接进自己的前端、调用 MCP 工具被 OAuth 卡住时，设为 false 即可。
-# 也可用环境变量 OMBRE_MCP_REQUIRE_AUTH=false 覆盖（Docker 用户更方便，优先级最高）。
-# ⚠️ 关掉后请确保服务不直接暴露公网，或在反代层另加鉴权——否则任何人都能读写记忆。
-# true (default): force OAuth 2.1 + PKCE on HTTPS /mcp connections (required by claude.ai web).
-# false: skip OAuth entirely so any client (your own frontend / GPT / GLM / custom scripts)
-#        can hit /mcp without auth. Set this when integrating OB into your own frontend and
-#        OAuth blocks your MCP tool calls. Env var OMBRE_MCP_REQUIRE_AUTH=false also works.
-# ⚠️ When disabled, do not expose the service directly to the public internet without
-#    another auth layer at the reverse proxy — otherwise anyone can read/write memories.
+# true  (默认): HTTP(S) /mcp 必须鉴权；具体使用 OAuth、静态 Token 或共存模式由下项选择。
+# false: 完全跳过 OAuth，仅允许配合已确认的本机回环网络边界使用。
+# 第三方客户端不支持 OAuth 时优先选择下面的静态 Token 模式。
+# false 会按用户明确配置生效；非回环/未知边界会产生高风险诊断，但不会被静默改回 true。
+# Dashboard/向导保存非回环免鉴权配置仍要求显式风险确认。
+# true (default): require auth on HTTP(S) /mcp; select OAuth or static-token mode below.
+# false: skip MCP auth after restart. Prefer static-token mode for LAN/NAS/public access;
+#        open access lets every caller reaching /mcp read and write the memory vault.
 mcp_require_auth: true
 
 # --- MCP auth mode / MCP 鉴权模式（仅 mcp_require_auth: true 时生效）---
 # "oauth" (默认): 上面的 OAuth 2.1 + PKCE。
-# "token": 改用静态密钥鉴权，与 OAuth 互斥——选了 token 后 OAuth 的 discovery/register/
+# "hybrid": 保留 OAuth 动态注册，同时让 Bearer 也接受 mcp_token，适合同一实例服务两类客户端。
+# "token": 只使用静态密钥——选了 token 后 OAuth 的 discovery/register/
 #          authorize/token 路由全部 404。适合支持自定义请求头、但走不通浏览器 OAuth
 #          授权流程的第三方 MCP 客户端。密钥填在 mcp_token（或环境变量 OMBRE_MCP_TOKEN，
 #          优先级更高），也可用环境变量 OMBRE_MCP_AUTH_MODE=token 覆盖。
 # 调用方式：请求头 Authorization: Bearer <token> 或 Ombre-MCP-Token: <token>（不支持 URL 参数）。
 # "oauth" (default): OAuth 2.1 + PKCE above.
-# "token": switch to a static secret instead, mutually exclusive with OAuth — once selected,
+# "hybrid": keep OAuth/DCR and also accept the pre-shared static Bearer token.
+# "token": switch to a static secret only — once selected,
 #          the OAuth discovery/register/authorize/token routes all 404. Useful for third-party
 #          MCP clients that support custom headers but can't complete browser OAuth. Set the
 #          secret via mcp_token (or env var OMBRE_MCP_TOKEN, which takes priority); env var
 #          OMBRE_MCP_AUTH_MODE=token also works.
 # Send it via header Authorization: Bearer <token> or Ombre-MCP-Token: <token> (no URL param).
-# ⚠️ 无论选 oauth / token / 关闭，都不要把服务直接暴露公网——Token 泄露等同任何人可读写全部记忆。
-# ⚠️ Regardless of mode, never expose this service directly to the public internet — a leaked
-#    token is equivalent to open read/write access to all memories.
+# ⚠️ 静态 Token 泄露等同任何人可读写全部记忆；公网连接必须使用 HTTPS 并妥善保管凭据。
+# ⚠️ Public connections require HTTPS and carefully protected credentials; a leaked token is
+#    equivalent to open read/write access to all memories.
 mcp_auth_mode: "oauth"
 mcp_token: ""
 
 # --- HTTP hooks auth / HTTP 钩子鉴权 ---
 # /breath-hook and /dream-hook are protected by default.
-# They accept the Dashboard login cookie, or this token via:
-#   ?token=...
+# They accept the Dashboard login cookie, or this token via the
+# X-Ombre-Hook-Token / Authorization: Bearer request headers (no URL parameter).
 #   X-Ombre-Hook-Token: ...
 #   Authorization: Bearer ...
 # Set allow_public=true only behind another trusted auth layer.
@@ -110,6 +127,11 @@ dehydration:
   max_tokens: 1024
   temperature: 0.1
   timeout_seconds: 120             # LLM request timeout seconds / LLM 请求超时秒数
+  # OpenAI-compatible provider extensions / OpenAI 兼容服务商扩展参数
+  # DeepSeek thinking models can disable reasoning to preserve the output budget:
+  # extra_body:
+  #   thinking:
+  #     type: disabled
 
 # --- Decay parameters / 记忆衰减参数 ---
 # Simulates Ebbinghaus forgetting curve, auto-archives inactive memories
@@ -150,6 +172,12 @@ scoring_weights:
 # --- Fuzzy matching / 模糊匹配参数 ---
 matching:
   fuzzy_threshold: 50             # Minimum match score (0-100) / 最低匹配分数
+  # 纯语义候选进入结果池的最低余弦相似度（默认 0.55）。
+  # 一条记忆哪怕一个关键词都不沾，只要语义相似度到这个数就能被检索到——
+  # 「问我的工作」这类查询全靠它，因为"我的工作"四个字不会字面出现在记忆里。
+  # 调高：召回更准但更少；调低：捞得更多但开始混进噪音。
+  # 3.2.0 从 0.65 下调到 0.55，依据见 src/bucket_manager.py 的扫描记录。
+  vector_recall_threshold: 0.55
   max_results: 5                  # Max results per search / 单次搜索最多返回条数
 
 # --- Surfacing defaults / 浮现默认参数 ---
@@ -158,8 +186,8 @@ matching:
 # AI 调用 breath() 不显式传 max_* 时使用这些默认；前端「浮现默认参数」面板会回写到这里。
 surfacing:
   breath_max_results: 20          # 1-50, hard cap of buckets returned per breath
-  breath_max_tokens: 10000        # 500-20000, total token cap per breath
-  feel_max_tokens: 6000           # 500-20000, full-text budget for feel history; older feels collapse to one-line summaries
+  breath_max_tokens: 10000        # 500-40000, total token cap per breath; 40000 is a safety ceiling, not the default
+  feel_max_tokens: 15000          # 500-20000, full-text budget for feel history; older feels collapse to one-line summaries
   # iter 1.8: weighted sampling for breath surfacing mode（无参数浮现）
   # 加权采样：从 top_k 候选里按 score**(1/temperature) 抽 sample_k 个，让"想起"带轻微随机性。
   # 测试 fixture 里默认关 (enabled=false)，保证排序确定。生产可以开。
@@ -170,19 +198,19 @@ surfacing:
     temperature: 0.7              # >1 更平均、<1 更偏向高分；0.7 是个温和的默认
 
 # --- Limits / 边界限制（iter 1.6 §5）---
-# Single-bucket size cap and pinned bucket quota. Exceeding either is
-# rejected at hold/grow/trace boundaries with a Chinese hint string.
-# 单桶字节上限 + pinned 桶数量上限。超出时在 hold/grow/trace 入口直接拒绝。
+# 单桶字节上限 + pinned/protected 独立配额。显式设为 protected
+# 时如配额已满，trace 会直接拒绝，不部分落盘。
 limits:
   max_bucket_bytes: 51200         # 50KB; 0 disables check
   max_import_upload_bytes: 67108864  # 64MB conversation import request cap
   max_mcp_request_bytes: 4194304  # 4MB HTTP body cap for /mcp; 0 disables
   max_management_request_bytes: 4194304  # 4MB cap for Dashboard/OAuth mutations; large import routes use their own caps
-  max_grow_input_bytes: 2097152   # 2MB total grow source/items cap; 0 disables
+  max_grow_input_bytes: 2097152   # source 与 items 正文各 2MB；HTTP 总请求另有限制；0 关闭软上限
   max_query_bytes: 16384          # 16KB breath/letter query cap; 0 disables
   max_metadata_bytes: 16384       # combined tool metadata/filter cap; 0 disables
   max_grow_items: 100             # pre-split/digest item count cap; 0 disables
   max_pinned: 20                  # max pinned buckets; 0 disables check
+  max_protected: 20               # protected 桶上限；0 关闭检查
 
 # --- iter 1.9 G: 桶类型默认值 / per-type frontmatter defaults ---
 # Applied at create() time only when caller doesn't pass that field.

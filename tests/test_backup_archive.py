@@ -23,6 +23,7 @@ from embedding_engine import EmbeddingEngine
 from migrate_engine import MigrateEngine
 import migrate_engine as migrate_mod
 from ombrebrain.storage import backup_archive as archive_mod
+from ombrebrain.storage.source_store import SourceStore
 
 
 class _Backend:
@@ -100,6 +101,8 @@ def test_export_archive_has_verified_manifest_and_sqlite_snapshot(tmp_path):
 def test_disk_export_streams_sources_without_path_read_bytes(tmp_path, monkeypatch):
     vault = tmp_path / "vault"
     bucket = _write_bucket(vault, content="streamed memory " * 10_000)
+    source_text = "流式备份中的原文证据\n"
+    source_ref = SourceStore(vault).put(source_text)
     with bucket.open("rb") as handle:
         expected_bucket = handle.read()
 
@@ -117,9 +120,24 @@ def test_disk_export_streams_sources_without_path_read_bytes(tmp_path, monkeypat
             package = read_backup_archive(handle.read())
         member = f"buckets/dynamic/general/{bucket.name}"
         assert package["files"][member] == expected_bucket
+        assert package["files"][f"sources/{source_ref}.source"] == source_text.encode()
         assert package["manifest"] == manifest
     finally:
         os.unlink(archive_path)
+
+
+def test_new_exports_refuse_dangling_source_references(tmp_path):
+    vault = tmp_path / "vault"
+    bucket = _write_bucket(vault)
+    post = frontmatter.load(bucket)
+    missing_ref = "src_" + "a" * 64
+    post.metadata["source_refs"] = [{"ref": missing_ref, "ranges": [[1, 1]]}]
+    bucket.write_text(frontmatter.dumps(post), encoding="utf-8")
+
+    with pytest.raises(BackupArchiveError, match="悬空原文证据引用"):
+        build_export_archive(str(vault), "", {"version": "test"})
+    with pytest.raises(BackupArchiveError, match="悬空原文证据引用"):
+        build_export_archive_file(str(vault), "", {"version": "test"})
 
 
 def test_disk_export_aborts_and_cleans_temp_files_at_compressed_cap(tmp_path, monkeypatch):
@@ -398,6 +416,146 @@ async def test_export_to_empty_vault_restores_markdown_and_current_embedding_sch
 
 
 @pytest.mark.asyncio
+async def test_export_restore_round_trip_preserves_source_evidence(tmp_path):
+    source_vault = tmp_path / "source"
+    source_config = _config(source_vault)
+    source_engine = _engine(source_config)
+    source_manager = BucketManager(source_config, embedding_engine=source_engine)
+    source_store = SourceStore(source_vault)
+    raw = "开场\n需要核对的原话\n尾声\n"
+    ref = source_store.put(raw)
+    bucket_id = await source_manager.create(
+        content="整理后事件",
+        title="核对标题",
+        source_refs=[{"ref": ref, "ranges": [[2, 2]]}],
+    )
+    payload, manifest = build_export_archive(
+        str(source_vault), "", {"exported_at": "now", "version": "test"}
+    )
+
+    assert any(item["path"] == f"sources/{ref}.source" for item in manifest["files"])
+
+    target_vault = tmp_path / "target"
+    target_config = _config(target_vault)
+    target_engine = _engine(target_config)
+    target_manager = BucketManager(target_config, embedding_engine=target_engine)
+    migrate = MigrateEngine(target_config, target_manager, target_engine)
+
+    parsed = await migrate.parse_zip(payload)
+    assert parsed["ok"] is True
+    await migrate.apply({})
+
+    restored = await target_manager.get(bucket_id)
+    assert restored["metadata"]["source_refs"] == [
+        {"ref": ref, "ranges": [[2, 2]]}
+    ]
+    assert SourceStore(target_vault).read(ref) == raw
+
+
+@pytest.mark.asyncio
+async def test_legacy_backup_with_dangling_source_ref_warns_but_restores_bucket(
+    tmp_path,
+):
+    source_vault = tmp_path / "source"
+    source_config = _config(source_vault)
+    source_engine = _engine(source_config)
+    source_manager = BucketManager(source_config, embedding_engine=source_engine)
+    source_store = SourceStore(source_vault)
+    ref = source_store.put("旧版没有打包这份原文")
+    bucket_id = await source_manager.create(
+        content="旧版事件",
+        title="旧版标题",
+        source_refs=[{"ref": ref, "ranges": [[1, 1]]}],
+    )
+    # Recreate the v2.10.0 package shape directly: its manifest was valid for
+    # the files it carried, but source evidence was not part of that file set.
+    bucket_path = Path(source_manager._find_bucket_file(bucket_id))
+    bucket_member = f"buckets/{bucket_path.relative_to(source_vault).as_posix()}"
+    export_meta = json.dumps({
+        "exported_at": "now",
+        "version": "2.10.0",
+    }).encode()
+    legacy_files = {
+        bucket_member: bucket_path.read_bytes(),
+        "export_meta.json": export_meta,
+    }
+    entries = [
+        {
+            "path": path,
+            "size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
+        for path, data in sorted(legacy_files.items())
+    ]
+    manifest = {
+        "schema_version": 1,
+        "kind": "ombre-brain-backup",
+        "created_at": "now",
+        "version": "2.10.0",
+        "file_count": len(entries),
+        "total_bytes": sum(item["size"] for item in entries),
+        "files": entries,
+    }
+    legacy_buffer = io.BytesIO()
+    with zipfile.ZipFile(legacy_buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for path, data in legacy_files.items():
+            archive.writestr(path, data)
+        archive.writestr("backup_manifest.json", json.dumps(manifest).encode())
+    payload = legacy_buffer.getvalue()
+
+    target_vault = tmp_path / "target"
+    target_config = _config(target_vault)
+    target_engine = _engine(target_config)
+    target_manager = BucketManager(target_config, embedding_engine=target_engine)
+    migrate = MigrateEngine(target_config, target_manager, target_engine)
+    parsed = await migrate.parse_zip(payload)
+
+    assert parsed["ok"] is True
+    assert "原文证据引用没有对应文件" in parsed["integrity_warning"]
+    await migrate.apply({})
+    assert (await target_manager.get(bucket_id))["content"] == "旧版事件"
+
+
+@pytest.mark.asyncio
+async def test_source_filename_hash_binding_survives_recomputed_manifest(tmp_path):
+    vault = tmp_path / "source"
+    _write_bucket(vault)
+    ref = SourceStore(vault).put("原始证据")
+    payload, _ = build_export_archive(
+        str(vault), "", {"exported_at": "now", "version": "test"}
+    )
+    member = f"sources/{ref}.source"
+    changed = "攻击者替换的证据".encode()
+    with zipfile.ZipFile(io.BytesIO(payload), "r") as archive:
+        manifest = json.loads(archive.read("backup_manifest.json"))
+    for entry in manifest["files"]:
+        if entry["path"] == member:
+            manifest["total_bytes"] += len(changed) - int(entry["size"])
+            entry["size"] = len(changed)
+            entry["sha256"] = hashlib.sha256(changed).hexdigest()
+            break
+    tampered = _rewrite_zip(
+        payload,
+        {
+            member: changed,
+            "backup_manifest.json": json.dumps(manifest).encode(),
+        },
+    )
+
+    target_config = _config(tmp_path / "target")
+    target_engine = _engine(target_config)
+    migrate = MigrateEngine(
+        target_config,
+        BucketManager(target_config, embedding_engine=target_engine),
+        target_engine,
+    )
+    parsed = await migrate.parse_zip(tampered)
+
+    assert parsed["ok"] is False
+    assert "SHA-256" in parsed["error"]
+
+
+@pytest.mark.asyncio
 async def test_keep_both_maps_imported_vector_to_new_id(tmp_path):
     source_vault = tmp_path / "source"
     _write_bucket(source_vault, content="imported version")
@@ -429,6 +587,27 @@ async def test_keep_both_maps_imported_vector_to_new_id(tmp_path):
     imported = next(bucket for bucket in buckets if bucket["content"] == "imported version")
     assert imported["id"] != "memory-1"
     assert await target_engine.get_embedding(imported["id"]) == [0.7, 0.8]
+
+
+def test_keep_both_relation_target_remap_preserves_other_ledger_fields(tmp_path):
+    path = _write_bucket(tmp_path, bucket_id="source")
+    post = frontmatter.load(path)
+    post["relation_links"] = [{
+        "target_bucket_id": "old-target", "type": "causes",
+        "label": "", "status": "detached",
+    }]
+    path.write_text(frontmatter.dumps(post), encoding="utf-8")
+    migrate = object.__new__(MigrateEngine)
+    migrate._atomic_write = lambda target, content: Path(target).write_text(content, encoding="utf-8")
+
+    migrate._remap_imported_relation_targets(
+        {"source": str(path)},
+        {"old-target": "new-target"},
+        frozenset({"source", "old-target"}),
+    )
+
+    remapped = frontmatter.load(path).metadata["relation_links"][0]
+    assert remapped == {"target_bucket_id": "new-target", "type": "causes", "label": "", "status": "detached"}
 
 
 @pytest.mark.asyncio

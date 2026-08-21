@@ -11,7 +11,6 @@ web/auth.py — Dashboard 鉴权相关 HTTP 路由
 """
 
 import asyncio
-import hmac
 import ipaddress
 import os
 import threading
@@ -167,7 +166,7 @@ def _setup_request_allowed(request: Request) -> bool:
     """Allow password bootstrap locally, or remotely with an explicit secret."""
     configured_token = os.environ.get("OMBRE_SETUP_TOKEN", "").strip()
     supplied_token = request.headers.get("X-Ombre-Setup-Token", "").strip()
-    if configured_token and supplied_token and hmac.compare_digest(
+    if configured_token and supplied_token and sh._constant_time_text_equal(
         configured_token, supplied_token
     ):
         return True
@@ -243,10 +242,13 @@ def register(mcp) -> None:
     async def auth_status(request: Request) -> Response:
         """Return auth state (authenticated, setup_needed)."""
         from starlette.responses import JSONResponse
-        return JSONResponse({
-            "authenticated": sh._is_authenticated(request),
-            "setup_needed": sh._is_setup_needed(),
-        })
+        return JSONResponse(
+            {
+                "authenticated": sh._is_authenticated(request),
+                "setup_needed": sh._is_setup_needed(),
+            },
+            headers={"Cache-Control": "no-store"},
+        )
 
     @mcp.custom_route("/auth/setup", methods=["POST"])
     async def auth_setup_endpoint(request: Request) -> Response:

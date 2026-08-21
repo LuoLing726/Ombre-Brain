@@ -92,21 +92,24 @@ class TraceVectorProjectionManifest:
                 "valid_vector_ids": [],
                 "malformed_vector_ids": [],
             }
-        with sqlite3.connect(self.db_path) as conn:
-            stored_rows = _safe_fetch_embeddings(conn)
-            meta = _safe_fetch_meta(conn)
+        stored_ids: list[str] = []
         valid_ids: list[str] = []
         malformed_ids: list[str] = []
-        for bucket_id, embedding_json in stored_rows:
-            if _valid_vector_json(embedding_json):
-                valid_ids.append(str(bucket_id))
-            else:
-                malformed_ids.append(str(bucket_id))
+        with sqlite3.connect(self.db_path) as conn:
+            # 向量 JSON 可能远大于 ID。逐行消费游标，确保任一时刻只解析一条
+            # 向量，避免 Dashboard 诊断在小内存实例上把全库正文 fetchall 进内存。
+            for bucket_id, embedding_json in _safe_iter_embeddings(conn):
+                stored_ids.append(bucket_id)
+                if _valid_vector_json(embedding_json):
+                    valid_ids.append(bucket_id)
+                else:
+                    malformed_ids.append(bucket_id)
+            meta = _safe_fetch_meta(conn)
         return {
             "db_exists": True,
             "model_name": meta.get("model_name", ""),
             "vector_dim": _int_value(meta.get("vector_dim")),
-            "stored_vector_ids": sorted(str(row[0]) for row in stored_rows),
+            "stored_vector_ids": sorted(stored_ids),
             "valid_vector_ids": sorted(valid_ids),
             "malformed_vector_ids": sorted(malformed_ids),
         }
@@ -122,20 +125,23 @@ def _expects_vector(trace: dict[str, Any]) -> bool:
     return trace_kind != "archived"
 
 
-def _safe_fetch_embeddings(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+def _safe_iter_embeddings(conn: sqlite3.Connection) -> Iterable[tuple[str, str]]:
     try:
-        rows = conn.execute("SELECT bucket_id, embedding FROM embeddings").fetchall()
+        cursor = conn.execute("SELECT bucket_id, embedding FROM embeddings")
     except sqlite3.Error:
-        return []
-    return [(str(bucket_id), str(embedding_json)) for bucket_id, embedding_json in rows]
+        return
+    # 建立查询时的“表不存在”保持旧兼容语义；若游标已在途中
+    # 读取失败，则应向上报告投影错误，不能把半份结果冒充完整诊断。
+    for bucket_id, embedding_json in cursor:
+        yield str(bucket_id), str(embedding_json)
 
 
 def _safe_fetch_meta(conn: sqlite3.Connection) -> dict[str, str]:
     try:
-        rows = conn.execute("SELECT key, value FROM embeddings_meta").fetchall()
+        rows = conn.execute("SELECT key, value FROM embeddings_meta")
+        return {str(key): str(value) for key, value in rows}
     except sqlite3.Error:
         return {}
-    return {str(key): str(value) for key, value in rows}
 
 
 def _valid_vector_json(value: str) -> bool:

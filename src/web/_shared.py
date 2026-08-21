@@ -47,6 +47,7 @@ from ombrebrain.app.execution import ExecutionEnvelope
 from ombrebrain.policy.update_policy import evaluate_update_manifest as _evaluate_update_manifest
 
 logger = logging.getLogger("ombre_brain")
+deletion_requests = None
 
 # --- 运行环境探测（Docker vs 裸机）---
 # 本地向量化要按宿主类型分流：Docker 里 ollama 是独立容器（连 ombre-ollama），
@@ -738,17 +739,6 @@ def _load_sessions() -> None:
         logger.warning(f"[auth] failed to load sessions: {e}")
 
 
-def _save_sessions() -> None:
-    """Atomically persist active sessions or raise on a durability failure."""
-    try:
-        with _session_state_lock:
-            _persist_sessions_locked(_sessions)
-    except Exception as e:
-        if isinstance(e, AuthPersistenceError):
-            raise
-        raise AuthPersistenceError("failed to persist dashboard sessions") from e
-
-
 def _persist_sessions_locked(sessions: dict[str, float]) -> None:
     """Persist one candidate registry while ``_session_state_lock`` is held."""
     path = _get_sessions_file()
@@ -887,6 +877,15 @@ def _credential_proof_matches(
         return _credential_proof_matches_locked(proof, strict=strict)
 
 
+def _constant_time_text_equal(left: str, right: str) -> bool:
+    """以 UTF-8 摘要恒定时间比较任意 Unicode 文本。"""
+    if not isinstance(left, str) or not isinstance(right, str):
+        return False
+    left_digest = hashlib.sha256(left.encode("utf-8")).digest()
+    right_digest = hashlib.sha256(right.encode("utf-8")).digest()
+    return hmac.compare_digest(left_digest, right_digest)
+
+
 def _verify_password_for_rotation(password: str) -> CredentialProof | None:
     """Verify a password and return the exact credential/generation checked."""
     with _auth_mutation_lock:
@@ -904,7 +903,7 @@ def _verify_password_for_rotation(password: str) -> CredentialProof | None:
             proof = CredentialProof("password_hash", stored, generation)
 
     if env_password:
-        verified = hmac.compare_digest(password, env_password)
+        verified = _constant_time_text_equal(password, env_password)
     else:
         verified = bool(stored) and _verify_secret(password, stored)
     if not verified:

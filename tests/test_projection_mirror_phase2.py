@@ -143,7 +143,7 @@ def test_bucket_manager_ledger_report_includes_sqlite_projection(
         manager = BucketManager(test_config, embedding_engine=fake_embedding_engine)
         bucket_id = await manager.create("sqlite projection source", domain=["sqlite"])
         await manager.update(bucket_id, resolved=True)
-        return manager, manager.ledger_integrity_report()
+        return manager, manager.ledger_integrity_report(rebuild_projections=True)
 
     manager, report = asyncio.run(scenario())
     projection = report["sqlite_projection"]
@@ -157,3 +157,70 @@ def test_bucket_manager_ledger_report_includes_sqlite_projection(
     assert projection["lag"] == 0
     assert Path(projection["path"]).exists()
     assert str(manager.base_dir) in projection["path"]
+
+
+def test_bucket_manager_default_ledger_report_does_not_create_or_rewrite_sqlite_projection(
+    test_config,
+    fake_embedding_engine,
+):
+    """默认诊断路径只观测，重建投影必须显式请求。"""
+    import asyncio
+    import sqlite3
+    from pathlib import Path
+
+    from bucket_manager import BucketManager
+
+    async def make_manager():
+        manager = BucketManager(test_config, embedding_engine=fake_embedding_engine)
+        await manager.create("read-only ledger report", domain=["audit"])
+        return manager
+
+    manager = asyncio.run(make_manager())
+    projection_path = (
+        Path(manager.base_dir) / "_ledger" / "projections" / "trace_catalog.sqlite3"
+    )
+
+    assert not projection_path.exists()
+    manager.ledger_integrity_report()
+    assert not projection_path.exists(), "a default integrity report created a durable projection"
+
+    projection_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(projection_path) as conn:
+        conn.execute("CREATE TABLE sentinel (value TEXT NOT NULL)")
+        conn.execute("INSERT INTO sentinel(value) VALUES ('keep-me')")
+    before = projection_path.read_bytes()
+
+    manager.ledger_integrity_report()
+
+    assert projection_path.read_bytes() == before, "a default integrity report rewrote a durable projection"
+
+
+def test_bucket_manager_default_ledger_report_does_not_refresh_existing_sqlite_projection(
+    test_config,
+    fake_embedding_engine,
+):
+    import asyncio
+    from pathlib import Path
+
+    from bucket_manager import BucketManager
+    from ombrebrain.projection.projection_sqlite import TraceSQLiteProjection
+
+    async def make_manager():
+        manager = BucketManager(test_config, embedding_engine=fake_embedding_engine)
+        await manager.create("projection snapshot one", domain=["audit"])
+        return manager
+
+    manager = asyncio.run(make_manager())
+    projection_path = (
+        Path(manager.base_dir) / "_ledger" / "projections" / "trace_catalog.sqlite3"
+    )
+    TraceSQLiteProjection(projection_path).rebuild(manager.ledger_mirror.iter_events())
+    before = projection_path.read_bytes()
+
+    asyncio.run(manager.create("projection snapshot two", domain=["audit"]))
+    report = manager.ledger_integrity_report()
+
+    assert projection_path.read_bytes() == before, "a read-only report refreshed the durable projection"
+    assert report["sqlite_projection"]["applied_seq"] == 1
+    assert report["sqlite_projection"]["source_latest_seq"] == 2
+    assert report["sqlite_projection"]["lag"] == 1

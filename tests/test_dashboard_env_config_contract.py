@@ -101,3 +101,19 @@ def test_main_config_save_also_keeps_embedding_base_url_with_model():
     source = html[start:end]
 
     assert "base_url: document.getElementById('cfg-emb-base-url').value" in source
+
+
+def test_main_config_load_and_save_preserve_valid_zero_values():
+    html = DASHBOARD.read_text(encoding="utf-8")
+    load_start = html.index("async function loadConfig()")
+    save_start = html.index("async function saveConfig(", load_start)
+    load_source = html[load_start:save_start]
+    save_end = html.index("checkAuth().then", save_start)
+    save_source = html[save_start:save_end]
+
+    assert "cfg.dehydration.temperature != null" in load_source
+    assert "cfg.merge_threshold != null" in load_source
+    assert "Number.isFinite(dehyTemperature) ? dehyTemperature : 0.1" in save_source
+    assert "Number.isFinite(mergeThreshold) ? mergeThreshold : 75" in save_source
+    assert "parseFloat(document.getElementById('cfg-dehy-temp').value) || 0.1" not in save_source
+    assert "parseInt(document.getElementById('cfg-merge').value) || 75" not in save_source

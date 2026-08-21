@@ -116,3 +116,36 @@ def test_architecture_package_exports_adr_requirements_contract():
     assert ADRChangeSpec(topic="new_memory_kind") is not None
     assert ADRRequirementIssue is not None
     assert ADRRequirementReport is not None
+
+
+def test_source_evidence_adr_satisfies_total_recall_contract():
+    from pathlib import Path
+
+    from ombrebrain.architecture import (
+        ADRChangeSpec,
+        ADRDocument,
+        ADRRequirementsContract,
+    )
+
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "docs"
+        / "adr"
+        / "ADR-0001-source-evidence-layer.md"
+    )
+    text = path.read_text(encoding="utf-8")
+    contract = ADRRequirementsContract.default()
+
+    assert contract.evaluate_document(
+        ADRDocument(
+            path=path.as_posix(),
+            text=text,
+            topics=("total_recall_like_feature",),
+        )
+    ).ok
+    assert contract.evaluate_change(
+        ADRChangeSpec(
+            topic="total_recall_like_feature",
+            adr_path=path.as_posix(),
+        )
+    ).ok

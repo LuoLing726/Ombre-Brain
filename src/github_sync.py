@@ -2,7 +2,7 @@
 github_sync.py — GitHub 仓库同步（用于 bucket 数据云端备份）
 
 策略：
-- 只同步 buckets_dir 下的 .md 文件（纯文本，体积小，可读性好）
+- 同步 buckets_dir 下的 .md 记忆和 _sources 下内容寻址的原文证据
 - embeddings.db 不上传（二进制，可由 /api/embedding/migrate 重算）
 - 使用 GitHub Git Trees API 批量提交（一次同步 = 一个 commit）
 - 支持手动触发 + 可选的定时自动同步
@@ -18,6 +18,7 @@ import hashlib
 import json
 import logging
 import os
+import tempfile
 import uuid
 from collections.abc import Iterator, Mapping
 from datetime import datetime, timezone
@@ -25,13 +26,19 @@ from typing import Any
 
 import httpx
 
+from ombrebrain.storage.source_store import (
+    HARD_MAX_SOURCE_BYTES,
+    SOURCE_REF_RE,
+    SourceStore,
+    referenced_source_ids_from_markdown,
+)
 from utils import _win_long_path
 
 logger = logging.getLogger("ombre_brain.github_sync")
 
 _API = "https://api.github.com"
 _TIMEOUT = 60.0
-_MAX_FILE_BYTES = 5 * 1024 * 1024  # GitHub single blob 上限 ~100MB，这里保守限 5MB
+_MAX_FILE_BYTES = HARD_MAX_SOURCE_BYTES  # GitHub blob 上限更高；与证据读取硬上限一致
 _TREE_CHUNK = 200                  # 每个 /git/trees 请求最多内联多少文件，避免单请求过大
 _TREE_CHUNK_BYTES = 2 * 1024 * 1024  # Bound decoded bodies retained by one request.
 _MAX_BACKUP_FILES = 10_000
@@ -40,6 +47,7 @@ _MAX_MANIFEST_PAYLOAD_BYTES = 4 * 1024 * 1024
 _MAX_MANIFEST_BASE64_BYTES = ((_MAX_MANIFEST_PAYLOAD_BYTES + 2) // 3) * 4 + 64 * 1024
 _MAX_RESTORE_TOTAL_BYTES = 512 * 1024 * 1024
 _MANIFEST_FILENAME = "_ombre_backup_manifest.json"
+_SOURCE_REFS_COMPLETE_FIELD = "source_refs_complete"
 
 
 class _LazyMarkdownFiles(Mapping[str, bytes]):
@@ -82,10 +90,38 @@ class _LazyMarkdownFiles(Mapping[str, bytes]):
                 f"GitHub backup file grew beyond {_MAX_FILE_BYTES} bytes: "
                 f"{relative_path}"
             )
+        if _is_source_relative_path(relative_path):
+            expected = relative_path.rsplit("/", 1)[-1][:-len(".source")]
+            if hashlib.sha256(content).hexdigest() != expected.removeprefix("src_"):
+                raise RuntimeError(
+                    f"GitHub backup source integrity mismatch: {relative_path}"
+                )
+            try:
+                content.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise RuntimeError(
+                    f"GitHub backup source is not UTF-8: {relative_path}"
+                ) from exc
         return content
 
 
-def _iter_markdown_paths(root_dir: str) -> Iterator[str]:
+def _is_source_relative_path(relative_path: str) -> bool:
+    parts = str(relative_path).replace("\\", "/").split("/")
+    return bool(
+        len(parts) == 2
+        and parts[0] == "_sources"
+        and parts[1].endswith(".source")
+        and SOURCE_REF_RE.fullmatch(parts[1][:-len(".source")])
+    )
+
+
+def _is_backup_relative_path(relative_path: str) -> bool:
+    return str(relative_path).endswith(".md") or _is_source_relative_path(
+        relative_path
+    )
+
+
+def _iter_backup_paths(root_dir: str) -> Iterator[str]:
     """Depth-first scandir traversal without materializing directory listings."""
     iterators: list[os.ScandirIterator] = []
     try:
@@ -118,8 +154,17 @@ def _iter_markdown_paths(root_dir: str) -> Iterator[str]:
                     except OSError as exc:
                         logger.warning(f"[github_sync] cannot scan {entry.path}: {exc}")
                     continue
-                if entry.name.endswith(".md") and entry.is_file(follow_symlinks=False):
-                    yield entry.path
+                if entry.is_file(follow_symlinks=False):
+                    if entry.name.endswith(".md"):
+                        yield entry.path
+                    elif entry.name.endswith(".source"):
+                        relative = os.path.relpath(entry.path, root_dir).replace("\\", "/")
+                        if relative.startswith("_sources/"):
+                            if not _is_source_relative_path(relative):
+                                raise RuntimeError(
+                                    f"invalid source evidence filename: {relative}"
+                                )
+                            yield entry.path
             except OSError as exc:
                 logger.warning(f"[github_sync] skip {entry.path}: {exc}")
     finally:
@@ -128,7 +173,7 @@ def _iter_markdown_paths(root_dir: str) -> Iterator[str]:
 
 
 class GitHubSync:
-    """向 GitHub 仓库批量上传 bucket .md 文件。"""
+    """向 GitHub 仓库批量上传记忆和原文证据。"""
 
     def __init__(
         self,
@@ -136,11 +181,17 @@ class GitHubSync:
         repo: str,
         branch: str = "main",
         path_prefix: str = "ombre",
+        max_source_bytes: int = 2 * 1024 * 1024,
     ):
         self.token = token
         self.repo = repo.strip()          # "owner/repo"
         self.branch = branch.strip() or "main"
         self.path_prefix = path_prefix.strip().strip("/")
+        configured_source_limit = max(0, int(max_source_bytes))
+        self.max_source_bytes = min(
+            configured_source_limit or HARD_MAX_SOURCE_BYTES,
+            HARD_MAX_SOURCE_BYTES,
+        )
 
         self._headers = {
             "Authorization": f"token {token}",
@@ -165,7 +216,7 @@ class GitHubSync:
     # --------------------------------------------------------
 
     async def sync(self, buckets_dir: str) -> dict[str, Any]:
-        """同步 buckets_dir 下所有 .md 到 GitHub。返回结果 dict。"""
+        """同步 buckets_dir 下记忆与原文证据到 GitHub。"""
         async with self._sync_lock:
             try:
                 files = self._collect_files(buckets_dir)
@@ -191,7 +242,7 @@ class GitHubSync:
                 return {"ok": False, "error": str(e)}
 
     async def import_from_github(self, buckets_dir: str) -> dict[str, Any]:
-        """从 GitHub 仓库把 path_prefix 下的所有 .md 拉回本地 buckets_dir（恢复 / 回滚）。
+        """从 GitHub 仓库恢复记忆和原文证据。
 
         这是 sync() 的逆操作。合并覆盖语义：同名（同相对路径）文件用 GitHub 上的覆盖，
         本地独有的文件保留不动。embeddings.db 不在仓库里，调用方应在导入后跑一次
@@ -202,6 +253,7 @@ class GitHubSync:
 
     async def _import_from_github_locked(self, buckets_dir: str) -> dict[str, Any]:
         """Serialized implementation shared with the backup lock."""
+        failure_context: dict[str, Any] = {}
         try:
             async with httpx.AsyncClient(headers=self._headers, timeout=_TIMEOUT) as c:
                 # 取 branch HEAD → commit tree → 递归列出全部 blob
@@ -247,14 +299,17 @@ class GitHubSync:
                         "GitHub backup manifest is unreadable; refusing an unverified restore"
                     )
                 manifest_entries = backup_manifest.pop("_entries", None)
-                targets = [
-                    t for t in tree
-                    if t.get("type") == "blob" and t.get("path", "").startswith(prefix)
-                    and t["path"].endswith(".md")
-                ]
+                targets = []
+                for target in tree:
+                    remote_path = str(target.get("path", ""))
+                    if target.get("type") != "blob" or not remote_path.startswith(prefix):
+                        continue
+                    relative_path = remote_path[len(prefix):]
+                    if _is_backup_relative_path(relative_path):
+                        targets.append(target)
                 if len(targets) > _MAX_BACKUP_FILES:
                     raise RuntimeError(
-                        f"GitHub restore has more than {_MAX_BACKUP_FILES} Markdown files"
+                        f"GitHub restore has more than {_MAX_BACKUP_FILES} files"
                     )
                 target_by_rel: dict[str, dict[str, Any]] = {}
                 declared_total = 0
@@ -297,32 +352,43 @@ class GitHubSync:
                         raise RuntimeError("backup manifest summary is inconsistent")
                     # Git Trees are cumulative; files deleted locally can remain
                     # in an older base tree.  A valid manifest is the canonical
-                    # file set, so ignore stale remote Markdown outside it.
+                    # file set, so ignore stale remote files outside it.
                     target_by_rel = {
                         rel: target_by_rel[rel] for rel in expected_manifest
                     }
                     targets = list(target_by_rel.values())
                 if not targets:
                     return {"ok": True, "imported": 0, "skipped": 0,
-                            "message": f"GitHub 仓库 {self.repo} 的 {prefix or '/'} 下没有 .md 记忆文件",
+                            "message": f"GitHub 仓库 {self.repo} 的 {prefix or '/'} 下没有可恢复的记忆文件",
                             "backup_manifest": backup_manifest}
 
+                failure_context = {
+                    "total": len(targets),
+                    "backup_manifest": backup_manifest,
+                }
                 base = os.path.abspath(buckets_dir)
                 imported = 0
+                buckets_imported = 0
+                sources_imported = 0
                 skipped = 0
-                restored_bytes = 0
                 errors: list[str] = []
-                for t in targets:
-                    rel = t["path"][len(prefix):]
-                    if not rel:
-                        continue
-                    # path-traversal 防护：解析后必须仍在 buckets_dir 内
-                    dest = os.path.abspath(os.path.join(base, rel))
-                    if dest != base and not dest.startswith(base + os.sep):
-                        skipped += 1
-                        errors.append(f"{rel}: 越界路径，已跳过")
-                        continue
-                    try:
+                # 先把远端不可变 blob 全部下载到临时区并完成清单/证据校验。
+                # 只有所有文件都通过，才安装证据；只有所有证据都安装成功，
+                # 才开始覆盖 Markdown。这样 tree 顺序不会造成“桶已恢复但证据
+                # 最后才失败”的悬空 source_refs。
+                with tempfile.TemporaryDirectory(
+                    prefix="ombre-github-restore-"
+                ) as staging_dir:
+                    staged: dict[str, str] = {}
+                    restored_bytes = 0
+                    for index, t in enumerate(targets):
+                        rel = t["path"][len(prefix):]
+                        if not rel:
+                            continue
+                        dest = os.path.abspath(os.path.join(base, rel))
+                        if dest != base and not dest.startswith(base + os.sep):
+                            raise RuntimeError(f"{rel}: restore path escapes the vault")
+                        self._assert_safe_restore_destination(base, rel)
                         rb = await self._request(c, "GET", f"{_API}/repos/{self.repo}/git/blobs/{t['sha']}")
                         rb.raise_for_status()
                         bj = rb.json()
@@ -346,33 +412,113 @@ class GitHubSync:
                                 != expected["sha256"]
                             ):
                                 raise RuntimeError("backup manifest integrity mismatch")
-                        self._assert_safe_restore_destination(base, rel)
-                        # _win_long_path 前缀绕开 Windows 260 字符 MAX_PATH：恢复
-                        # 备份是这个前缀存在的头号场景——sanitize 后的深层 domain
-                        # 路径叠上一个本来就很长的安装目录，真的会超限（同款问题
-                        # utils.atomic_write_text 已经踩过并修过）。
-                        dest_long = _win_long_path(dest)
-                        os.makedirs(_win_long_path(os.path.dirname(dest)), exist_ok=True)
-                        # 原子写：导入是覆盖本地记忆的操作，写到一半被中断绝不能留半截文件。
-                        _tmp = f"{dest}.{uuid.uuid4().hex}.tmp"
-                        _tmp_long = _win_long_path(_tmp)
+                        if _is_source_relative_path(rel):
+                            filename = rel.rsplit("/", 1)[-1]
+                            ref = filename[:-len(".source")]
+                            if hashlib.sha256(data).hexdigest() != ref.removeprefix("src_"):
+                                raise RuntimeError("source evidence integrity mismatch")
+                            try:
+                                data.decode("utf-8")
+                            except UnicodeDecodeError as exc:
+                                raise RuntimeError("source evidence is not UTF-8") from exc
+
+                        stage_path = os.path.join(staging_dir, f"{index:05d}.blob")
+                        with open(stage_path, "wb") as stage_handle:
+                            stage_handle.write(data)
+                        staged[rel] = stage_path
+
+                    referenced_sources: set[str] = set()
+                    available_sources = {
+                        rel.rsplit("/", 1)[-1][:-len(".source")]
+                        for rel in staged
+                        if _is_source_relative_path(rel)
+                    }
+                    for rel in sorted(staged):
+                        if not rel.endswith(".md"):
+                            continue
+                        with open(staged[rel], "rb") as markdown_handle:
+                            markdown = markdown_handle.read(_MAX_FILE_BYTES + 1)
+                        if len(markdown) > _MAX_FILE_BYTES:
+                            raise RuntimeError(f"{rel}: staged Markdown exceeds limit")
                         try:
-                            with open(_tmp_long, "wb") as f:
-                                f.write(data)
-                                f.flush()
-                                os.fsync(f.fileno())
-                            os.replace(_tmp_long, dest_long)
-                        except Exception:
-                            if os.path.exists(_tmp_long):
-                                try:
-                                    os.remove(_tmp_long)
-                                except OSError:
-                                    pass
-                            raise
+                            referenced_sources.update(
+                                referenced_source_ids_from_markdown(markdown)
+                            )
+                        except ValueError as exc:
+                            raise RuntimeError(
+                                f"{rel}: invalid source evidence references: {exc}"
+                            ) from exc
+
+                    missing_sources = sorted(
+                        referenced_sources - available_sources
+                    )
+                    integrity_warning = ""
+                    if missing_sources:
+                        preview = ", ".join(missing_sources[:3])
+                        if backup_manifest.get(_SOURCE_REFS_COMPLETE_FIELD) is True:
+                            raise RuntimeError(
+                                "GitHub backup declares complete source evidence but has "
+                                f"dangling references: {preview}"
+                            )
+                        integrity_warning = (
+                            f"备份中有 {len(missing_sources)} 个原文证据引用没有对应文件；"
+                            "这通常来自 v2.10.0 及更早的 GitHub 备份，事件记忆仍已恢复，"
+                            "但这些原文无法核对"
+                        )
+
+                    source_store = SourceStore(
+                        base, max_bytes=self.max_source_bytes
+                    )
+                    for rel in sorted(staged):
+                        if not _is_source_relative_path(rel):
+                            continue
+                        with open(staged[rel], "rb") as source_handle:
+                            data = source_handle.read(_MAX_FILE_BYTES + 1)
+                        if len(data) > _MAX_FILE_BYTES:
+                            raise RuntimeError(f"{rel}: staged source exceeds limit")
+                        ref = rel.rsplit("/", 1)[-1][:-len(".source")]
+                        installed_ref = source_store.put(data.decode("utf-8"))
+                        if installed_ref != ref:
+                            raise RuntimeError(f"{rel}: source evidence reference mismatch")
                         imported += 1
-                    except Exception as e:
-                        skipped += 1
-                        errors.append(f"{rel}: {e}")
+                        sources_imported += 1
+
+                    for rel in sorted(staged):
+                        if _is_source_relative_path(rel):
+                            continue
+                        dest = os.path.abspath(os.path.join(base, rel))
+                        try:
+                            self._assert_safe_restore_destination(base, rel)
+                            with open(staged[rel], "rb") as stage_handle:
+                                data = stage_handle.read(_MAX_FILE_BYTES + 1)
+                            if len(data) > _MAX_FILE_BYTES:
+                                raise RuntimeError("staged file exceeds limit")
+                            # _win_long_path 前缀绕开 Windows 260 字符 MAX_PATH。
+                            dest_long = _win_long_path(dest)
+                            os.makedirs(
+                                _win_long_path(os.path.dirname(dest)), exist_ok=True
+                            )
+                            # 单个 Markdown 原子覆盖；证据已经全部安装成功。
+                            temp_path = f"{dest}.{uuid.uuid4().hex}.tmp"
+                            temp_long = _win_long_path(temp_path)
+                            try:
+                                with open(temp_long, "wb") as output_handle:
+                                    output_handle.write(data)
+                                    output_handle.flush()
+                                    os.fsync(output_handle.fileno())
+                                os.replace(temp_long, dest_long)
+                            except Exception:
+                                if os.path.exists(temp_long):
+                                    try:
+                                        os.remove(temp_long)
+                                    except OSError:
+                                        pass
+                                raise
+                            imported += 1
+                            buckets_imported += 1
+                        except Exception as exc:
+                            skipped += 1
+                            errors.append(f"{rel}: {exc}")
 
                 self.last_sync = _now_iso()
                 restore_ok = skipped == 0
@@ -380,14 +526,34 @@ class GitHubSync:
                 return {
                     "ok": restore_ok,
                     "imported": imported,
+                    "buckets_imported": buckets_imported,
+                    "sources_imported": sources_imported,
                     "skipped": skipped,
                     "total": len(targets),
                     "truncated": False,
+                    "error": errors[0] if errors else "",
                     "errors": errors[:10],
                     "backup_manifest": backup_manifest,
+                    "integrity_warning": integrity_warning,
                 }
         except Exception as e:
             logger.error(f"[github_sync] import failed: {e}")
+            self.last_status = "error"
+            self.last_error = str(e)
+            if failure_context:
+                total = int(failure_context["total"])
+                return {
+                    "ok": False,
+                    "imported": 0,
+                    "buckets_imported": 0,
+                    "sources_imported": 0,
+                    "skipped": total,
+                    "total": total,
+                    "truncated": False,
+                    "error": str(e)[:500],
+                    "errors": [str(e)[:500]],
+                    "backup_manifest": failure_context["backup_manifest"],
+                }
             return {"ok": False, "error": str(e)}
 
     async def validate(self) -> dict[str, Any]:
@@ -442,12 +608,12 @@ class GitHubSync:
     # --------------------------------------------------------
 
     def _collect_files(self, buckets_dir: str) -> Mapping[str, bytes]:
-        """Index eligible Markdown paths without retaining their bodies."""
+        """Index eligible memory/evidence paths without retaining their bodies."""
         paths: dict[str, str] = {}
         if not os.path.isdir(buckets_dir):
             return _LazyMarkdownFiles(paths)
         base_real = os.path.realpath(buckets_dir)
-        for full in _iter_markdown_paths(buckets_dir):
+        for full in _iter_backup_paths(buckets_dir):
             try:
                 full_real = os.path.realpath(full)
                 if os.path.commonpath((base_real, full_real)) != base_real:
@@ -457,6 +623,11 @@ class GitHubSync:
                     continue
                 size = os.path.getsize(full)
                 if size > _MAX_FILE_BYTES:
+                    relative = os.path.relpath(full, buckets_dir).replace("\\", "/")
+                    if _is_source_relative_path(relative):
+                        raise RuntimeError(
+                            f"GitHub backup source exceeds {_MAX_FILE_BYTES} bytes: {relative}"
+                        )
                     logger.warning(
                         f"[github_sync] skip {os.path.basename(full)}: "
                         f"too large ({size} bytes)"
@@ -540,6 +711,12 @@ class GitHubSync:
             )
         entries = []
         total_bytes = 0
+        available_sources = {
+            str(path).rsplit("/", 1)[-1][:-len(".source")]
+            for path in files
+            if _is_source_relative_path(str(path))
+        }
+        referenced_sources: set[str] = set()
         # Sorting keys is cheap.  Sorting ``files.items()`` would force a lazy
         # mapping to materialize every body at once and reintroduce the OOM.
         for rel_path in sorted(files):
@@ -550,15 +727,32 @@ class GitHubSync:
                 )
             content = files[rel_path]
             size = len(content)
+            if str(rel_path).endswith(".md"):
+                try:
+                    referenced_sources.update(
+                        referenced_source_ids_from_markdown(content)
+                    )
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"GitHub backup cannot validate {rel_path}: {exc}"
+                    ) from exc
             total_bytes += size
             entries.append({
                 "path": rel_path,
                 "bytes": size,
                 "sha256": hashlib.sha256(content).hexdigest(),
             })
+        missing_sources = sorted(referenced_sources - available_sources)
+        if missing_sources:
+            preview = ", ".join(missing_sources[:3])
+            raise RuntimeError(
+                "GitHub backup has dangling source evidence references: "
+                f"{preview}"
+            )
         return {
             "schema_version": 1,
             "source": "ombre-brain",
+            _SOURCE_REFS_COMPLETE_FIELD: True,
             "generated_at": _now_iso(),
             "repo": self.repo,
             "branch": self.branch,
@@ -780,7 +974,7 @@ class GitHubSync:
             data = json.loads(raw)
             if not isinstance(data, dict):
                 raise ValueError("backup manifest root must be an object")
-            return {
+            summary = {
                 "present": True,
                 "schema_version": data.get("schema_version"),
                 "generated_at": data.get("generated_at", ""),
@@ -788,6 +982,9 @@ class GitHubSync:
                 "total_bytes": int(data.get("total_bytes") or 0),
                 "_entries": data.get("files"),
             }
+            if data.get(_SOURCE_REFS_COMPLETE_FIELD) is True:
+                summary[_SOURCE_REFS_COMPLETE_FIELD] = True
+            return summary
         except Exception as e:
             return {"present": False, "error": str(e)[:200]}
 

@@ -14,6 +14,18 @@ fc = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(fc)
 
 
+def test_dockerfile_cloudflared_install_fails_closed():
+    dockerfile = (_MOD_PATH.parents[1] / "Dockerfile").read_text(encoding="utf-8")
+    install_step = dockerfile.split("# Install dependencies first", 1)[0]
+
+    assert "RUN set -eu;" in install_step
+    assert (
+        "python /tmp/fetch_cloudflared.py /usr/local/bin/cloudflared;"
+        in install_step
+    )
+    assert "&& chmod +x /usr/local/bin/cloudflared;" not in install_step
+
+
 def test_arch_mapping_covers_common_platforms():
     assert fc.cloudflared_arch("x86_64") == "amd64"
     assert fc.cloudflared_arch("aarch64") == "arm64"

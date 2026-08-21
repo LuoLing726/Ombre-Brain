@@ -13,6 +13,22 @@ from typing import Any, Iterable
 
 _ARCHIVED_KINDS = {"archived", "deleted", "tombstone"}
 
+_ACTOR_LABELS = {
+    "llm": "LLM",
+    "human": "用户",
+    "system": "系统",
+}
+
+_SOURCE_LABELS = {
+    "hold": "hold",
+    "grow": "grow",
+    "import": "用户导入",
+    "plan": "plan",
+    "letter": "letter",
+    "i": "I",
+    "direct": "系统直接",
+}
+
 
 @dataclass(frozen=True)
 class FootprintSnapshot:
@@ -63,7 +79,11 @@ def _event_label(event: dict[str, Any]) -> str:
     event_type = str(event.get("event_type") or "")
     payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
     if event_type == "TraceCreated":
-        return "创建"
+        source = str(payload.get("source_tool") or "direct").strip().lower()
+        source_label = _SOURCE_LABELS.get(source, "已声明来源")
+        actor_label = _actor_label(payload)
+        pinned_suffix = "并钉为核心" if payload.get("pinned") else ""
+        return f"{actor_label}经{source_label}创建{pinned_suffix}"
     if event_type == "TraceRestored":
         return "重新回忆"
     if event_type == "TraceArchived":
@@ -81,7 +101,8 @@ def _event_label(event: dict[str, Any]) -> str:
     if "dont_surface" in fields:
         return "主动淡忘" if payload.get("dont_surface") else "重新浮现"
     if "pinned" in fields:
-        return "钉为核心" if payload.get("pinned") else "解除核心"
+        action = "钉为核心" if payload.get("pinned") else "解除核心"
+        return f"{_actor_label(payload)}{action}"
     if "anchor" in fields:
         return "设为地标" if payload.get("anchor") else "解除地标"
     if "resolved" in fields:
@@ -89,3 +110,8 @@ def _event_label(event: dict[str, Any]) -> str:
     if "content" in fields:
         return "正文重构"
     return "更新"
+
+
+def _actor_label(payload: dict[str, Any]) -> str:
+    actor = str(payload.get("event_actor") or "").strip().lower()
+    return _ACTOR_LABELS.get(actor, "操作者未记录")

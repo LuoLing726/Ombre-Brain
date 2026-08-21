@@ -17,7 +17,8 @@ tools/breath/search.py — 有 query 的检索模式
 
 不做什么（边界）：
 - 不返回 feel/plan/letter（专用通道有自己的入口）
-- pinned/protected/permanent 仍可被检索（也是记忆，只是同时在浮现模式置顶）
+- pinned/permanent 仍可检索并标为核心准则；protected 只在显式
+  检索命中时返回，并标为「受保护记忆」，不进入随机漂浮
 - dont_surface/digested 在真实检索命中中保留；只限制无参浮现和非命中随机漂浮
 
 对外暴露：surface_search(query, max_results, max_tokens, domain, valence,
@@ -32,8 +33,10 @@ from datetime import datetime, time
 
 from ombrebrain.policy.surfacing import SurfacePolicyVM
 from .. import _runtime as rt
+from ..plan.core import is_letter_bucket
+from ombrebrain.storage.quote_store import quotes_from_metadata, render_quotes
 from ._verbatim import render_stored_bucket
-from utils import parse_iso_datetime
+from utils import count_tokens_approx, parse_bool, parse_iso_datetime
 
 _SURFACE_POLICY = SurfacePolicyVM.default()
 
@@ -65,8 +68,16 @@ def _is_archived(bucket: dict) -> bool:
 
 def _render_archived_hit(bucket: dict, footprint: str) -> tuple[str, int]:
     bucket_id = str(bucket.get("id") or "")
+    protected_mark = (
+        "🛡️ [受保护记忆] "
+        if parse_bool(
+            (bucket.get("metadata", {}) or {}).get("protected"),
+            default=False,
+        )
+        else ""
+    )
     header = (
-        f"[query 命中·已删除到档案] [bucket_id:{bucket_id}] "
+        f"{protected_mark}[query 命中·已删除到档案] [bucket_id:{bucket_id}] "
         "[状态:已退出日常记忆，原文仍保留]"
     )
     rendered, _ = render_stored_bucket(bucket, header, footprint)
@@ -199,6 +210,7 @@ async def surface_search(
     tag_filter: list,
     date_from: str = "",
     date_to: str = "",
+    with_quotes: bool = False,
 ) -> str:
     domain_filter = [d.strip() for d in domain.split(",") if d.strip()] or None
     q_valence = valence if 0 <= valence <= 1 else None
@@ -244,6 +256,8 @@ async def surface_search(
         )
         exact_bucket = None
     if exact_bucket:
+        if is_letter_bucket(exact_bucket):
+            return "Letter 不通过普通 breath 检索返回；请使用 letter_read。"
         meta = exact_bucket.get("metadata", {}) or {}
         is_archived = _is_archived(exact_bucket)
         archived_original_kind = (
@@ -268,9 +282,15 @@ async def surface_search(
             and _bucket_has_tags(meta, tag_filter)
             and _bucket_in_created_range(exact_bucket, created_from, created_to)
         ):
+            protected_mark = (
+                "🛡️ [受保护记忆] "
+                if parse_bool(meta.get("protected"), default=False)
+                else ""
+            )
             rendered, entry_tokens = render_stored_bucket(
                 exact_bucket,
-                f"[exact_bucket_id:true] [bucket_id:{exact_bucket['id']}]",
+                f"{protected_mark}[exact_bucket_id:true] "
+                f"[bucket_id:{exact_bucket['id']}]",
                 _footprint(exact_bucket),
             )
             if entry_tokens > max_tokens:
@@ -316,6 +336,8 @@ async def surface_search(
     eligible_matches = []
     for bucket in matches:
         meta = bucket.get("metadata", {}) or {}
+        if is_letter_bucket(bucket):
+            continue
         if _is_archived(bucket):
             original_kind = (
                 footprint_snapshot.original_kind(str(bucket.get("id") or ""), meta)
@@ -350,7 +372,12 @@ async def surface_search(
         bucket_id = bucket["id"]
         if _is_archived(bucket):
             rendered, entry_tokens = _render_archived_hit(bucket, _footprint(bucket))
-        elif meta.get("pinned") or meta.get("protected") or meta.get("type") == "permanent":
+        elif parse_bool(meta.get("protected"), default=False):
+            header = f"🛡️ [受保护记忆] [bucket_id:{bucket_id}]"
+            rendered, entry_tokens = render_stored_bucket(
+                bucket, header, _footprint(bucket)
+            )
+        elif meta.get("pinned") or meta.get("type") == "permanent":
             header = f"📌 [核心准则] [bucket_id:{bucket_id}]"
             rendered, entry_tokens = render_stored_bucket(
                 bucket, header, _footprint(bucket)
@@ -365,6 +392,15 @@ async def surface_search(
             rendered, entry_tokens = render_stored_bucket(
                 bucket, header, _footprint(bucket)
             )
+        # 引语：唯一的出口就在这里。默认不附加——每一条浮现路径
+        # （breath / dream / catalog / feel）走的都是白名单渲染，读不到这个字段。
+        # 只有我在这次调用里明确说了「我想知道当时是怎么说的」，它才出现。
+        # 附加之后必须重算 token：预算是按实际返回的字数算的，不是按正文。
+        if with_quotes:
+            quote_block = render_quotes(quotes_from_metadata(meta))
+            if quote_block:
+                rendered = f"{rendered}\n{quote_block}"
+                entry_tokens = count_tokens_approx(rendered)
         if token_used + entry_tokens > max_tokens:
             budget_blocked = True
             break
@@ -390,7 +426,11 @@ async def surface_search(
                 and _SURFACE_POLICY.evaluate_bucket(
                     b, mode="spontaneous"
                 ).allowed
+                and not is_letter_bucket(b)
                 and b["metadata"].get("type") not in ("feel", "plan", "letter")
+                and not parse_bool(
+                    b["metadata"].get("protected"), default=False
+                )
                 and rt.decay_engine.calculate_score(b["metadata"]) < 2.0
                 and _bucket_in_created_range(b, created_from, created_to)
             ]

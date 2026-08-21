@@ -1,6 +1,8 @@
 import json
 import sqlite3
 
+import pytest
+
 from ombrebrain.eventsourcing.ledger_mirror import LedgerMirror
 
 
@@ -93,6 +95,101 @@ def test_vector_projection_manifest_reports_embedding_drift_without_mutation(tmp
     assert report["orphan_vector_ids"] == ["bad-vector", "orphan"]
     assert report["malformed_vector_ids"] == ["bad-vector"]
     assert report["applied_seq"] == ledger.latest_seq()
+
+
+def test_vector_projection_reads_embedding_rows_as_a_stream(monkeypatch, tmp_path):
+    from ombrebrain.projection import projection_vector as projection_mod
+
+    class StreamingCursor:
+        def __init__(self, rows):
+            self.rows = rows
+            self.iterated = False
+
+        def __iter__(self):
+            self.iterated = True
+            return iter(self.rows)
+
+        def fetchall(self):
+            raise AssertionError("vector projection must not fetchall")
+
+    embedding_cursor = StreamingCursor(
+        [
+            ("valid", json.dumps([0.1, 0.2])),
+            ("malformed", "{not json"),
+        ]
+    )
+    meta_cursor = StreamingCursor(
+        [("model_name", "stream-model"), ("vector_dim", "2")]
+    )
+
+    class StreamingConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, query):
+            if "FROM embeddings_meta" in query:
+                return meta_cursor
+            if "FROM embeddings" in query:
+                return embedding_cursor
+            raise AssertionError(f"unexpected query: {query}")
+
+    db_path = tmp_path / "streaming.db"
+    db_path.touch()
+    monkeypatch.setattr(
+        projection_mod.sqlite3,
+        "connect",
+        lambda _path: StreamingConnection(),
+    )
+
+    report = projection_mod.TraceVectorProjectionManifest(db_path)._read_db()
+
+    assert embedding_cursor.iterated is True
+    assert meta_cursor.iterated is True
+    assert report == {
+        "db_exists": True,
+        "model_name": "stream-model",
+        "vector_dim": 2,
+        "stored_vector_ids": ["malformed", "valid"],
+        "valid_vector_ids": ["valid"],
+        "malformed_vector_ids": ["malformed"],
+    }
+
+
+def test_vector_projection_does_not_report_partial_rows_after_cursor_failure(
+    monkeypatch,
+    tmp_path,
+):
+    from ombrebrain.projection import projection_vector as projection_mod
+
+    class FailingCursor:
+        def __iter__(self):
+            yield "first", json.dumps([0.1])
+            raise sqlite3.OperationalError("cursor read failed")
+
+    class FailingConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, query):
+            assert "FROM embeddings" in query
+            return FailingCursor()
+
+    db_path = tmp_path / "failing-stream.db"
+    db_path.touch()
+    monkeypatch.setattr(
+        projection_mod.sqlite3,
+        "connect",
+        lambda _path: FailingConnection(),
+    )
+
+    with pytest.raises(sqlite3.OperationalError, match="cursor read failed"):
+        projection_mod.TraceVectorProjectionManifest(db_path)._read_db()
 
 
 def test_bucket_manager_ledger_report_includes_vector_projection(

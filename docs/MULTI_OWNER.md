@@ -55,6 +55,8 @@ docker compose -f deploy/docker-compose.multi.yml up -d --build
 ```
 
 `deploy/docker-compose.multi.yml` 每个人一个 service（独立卷 + 独立端口 + `OMBRE_OWNER_NAME`）。
+如果使用 `token` 或 `hybrid` 鉴权，还必须给每个 service 配置不同的静态密钥（示例中的
+`OMBRE_MING_MCP_TOKEN` / `OMBRE_HONG_MCP_TOKEN`），避免一个 owner 的凭据跨实例访问其他人的记忆。
 **加人**：照抄一个 service 块，改 `container_name` / 端口 / 卷 / `OMBRE_OWNER_NAME`，并把每个块的
 `OMBRE_OWNER_COUNT` 一起改成新的总人数。敏感 key 走 `deploy/.env`。
 

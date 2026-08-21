@@ -23,9 +23,10 @@ WORKDIR /app
 # 不需要 Tunnel 的用户可 `docker build --build-arg INSTALL_CLOUDFLARED=0 ...` 完全跳过。
 ARG INSTALL_CLOUDFLARED=1
 COPY deploy/fetch_cloudflared.py /tmp/fetch_cloudflared.py
-RUN if [ "$INSTALL_CLOUDFLARED" = "1" ]; then \
-        python /tmp/fetch_cloudflared.py /usr/local/bin/cloudflared \
-        && chmod +x /usr/local/bin/cloudflared; \
+RUN set -eu; \
+    if [ "$INSTALL_CLOUDFLARED" = "1" ]; then \
+        python /tmp/fetch_cloudflared.py /usr/local/bin/cloudflared; \
+        chmod +x /usr/local/bin/cloudflared; \
     else \
         echo "[build] INSTALL_CLOUDFLARED=0 → 跳过 cloudflared（Tunnel 一键管理将不可用）"; \
     fi; \
@@ -59,6 +60,12 @@ RUN chmod +x ./entrypoint.sh
 # 出现「服务装完了但模型没拿到使用约定」的 onboarding 断点。内部设计稿
 # （docs/superpowers、docs/secrets 等）不在此列，仍被 .dockerignore 挡在外面。
 COPY docs/CLAUDE_PROMPT.md docs/ENVIRONMENT_VARIABLES.md docs/INTERNALS.md docs/MULTI_OWNER.md docs/OPERATIONS.md ./docs/
+# ADR 与 preflight CLI：两项系统诊断（adr_requirements / preflight_cli_diagnostics）
+# 在运行时目录下分别读 docs/adr/ 与 tools/vnext_preflight.py。镜像此前不含这两处，
+# 诊断在任何 Docker 部署上都报 not found / missing_files。
+COPY docs/adr/ ./docs/adr/
+COPY tools/ ./tools/
+COPY kernel/ ./kernel/
 COPY README.md ./README.md
 COPY CHANGELOG.md ./CHANGELOG.md
 

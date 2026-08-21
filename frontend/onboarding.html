@@ -58,8 +58,8 @@
     </div>
     <div id="advanced-fields">
       <div class="row">
-        <div><label for="transport">MCP transport</label><select id="transport"><option value="streamable-http">streamable-http</option><option value="sse">sse</option><option value="stdio">stdio</option></select></div>
-        <div><label for="advanced-auth">MCP OAuth</label><select id="advanced-auth"><option value="true">开启（推荐）</option><option value="false">关闭（需外部安全边界）</option></select></div>
+        <div><label for="transport">MCP transport</label><select id="transport"><option value="streamable-http">streamable-http</option><option value="stdio">stdio</option></select></div>
+        <div><label for="advanced-auth">MCP 鉴权</label><select id="advanced-auth"><option value="true">开启（推荐）</option><option value="false">关闭（需外部安全边界）</option></select></div>
       </div>
     </div>
     <div id="mode-note" class="notice">请选择一种部署模式。</div>
@@ -117,17 +117,21 @@ function renderProfiles(items) {
 }
 
 function renderReport(report) {
+  const network = report.mcp_network_security || {};
   const lines = [
     '当前模式：' + report.profile,
     '配置文件：' + (report.config_path || '未识别'),
     '已保存 transport：' + report.saved.transport,
     '当前生效 transport：' + report.effective.transport,
-    '已保存 OAuth：' + (report.saved.mcp_require_auth ? '开启' : '关闭'),
-    '当前生效 OAuth：' + (report.effective.mcp_require_auth ? '开启' : '关闭'),
+    '已保存 MCP 鉴权：' + (report.saved.mcp_require_auth ? '开启' : '关闭'),
+    '当前生效 MCP 鉴权：' + (report.effective.mcp_require_auth ? '开启' : '关闭'),
     '已保存鉴权模式：' + report.saved.mcp_auth_mode,
     '当前生效鉴权模式：' + report.effective.mcp_auth_mode,
     '已保存公网地址：' + (report.saved.public_url || '未设置'),
     '当前生效公网地址：' + (report.effective.public_url || '未设置'),
+    '进程监听地址：' + (report.effective.bind_host || '未识别'),
+    '容器宿主边界：' + (report.effective.external_bind_address || (network.in_docker ? '未声明' : '不适用')),
+    'MCP 网络门禁：' + (network.guard_active ? '已强制开启鉴权' : (network.override_active ? '已显式豁免（高风险）' : '正常')),
     '记忆目录：' + report.effective.buckets_dir,
     '持久性：' + ((report.persistence || {}).persistent ? '已确认' : '需要处理'),
   ];
@@ -142,7 +146,10 @@ async function preflight() {
   const result = document.getElementById('result');
   result.style.display = 'block';
   result.classList.toggle('bad', !data.ok);
-  result.textContent = data.ok ? '检查通过：保存后重启即可生效。' : (data.issues || [data.error]).join('；');
+  const warnings = Array.isArray(data.warnings) ? data.warnings : [];
+  result.textContent = data.ok
+    ? (warnings.length ? '检查通过，但存在高风险豁免：' + warnings.join('；') : '检查通过：保存后重启即可生效。')
+    : (data.issues || [data.error]).join('；');
   document.getElementById('save').disabled = !data.ok;
 }
 
@@ -156,7 +163,10 @@ async function saveProfile() {
     renderReport(data.report);
     const result = document.getElementById('result');
     result.style.display = 'block'; result.classList.remove('bad');
-    result.textContent = data.message + (data.report.overrides.length ? ' 注意：平台环境变量仍会覆盖部分设置。' : '');
+    const warnings = Array.isArray(data.warnings) ? data.warnings : [];
+    result.textContent = data.message
+      + (data.report.overrides.length ? ' 注意：平台环境变量仍会覆盖部分设置。' : '')
+      + (warnings.length ? ' 高风险豁免：' + warnings.join('；') : '');
     button.textContent = '已保存';
   } catch (error) {
     const result = document.getElementById('result');
@@ -167,7 +177,7 @@ async function saveProfile() {
 
 async function boot() {
   try {
-    const auth = await fetch('/auth/status');
+    const auth = await fetch('/auth/status', { cache: 'no-store' });
     const authData = await readJsonSafe(auth);
     if (!authData.authenticated) { location.href = '/'; return; }
     const response = await fetch('/api/onboarding/profile');

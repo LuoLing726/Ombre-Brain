@@ -7,6 +7,7 @@ import pytest
 
 import embedding_engine as embedding_engine_module
 import migration_engine
+import utils
 from web import embedding as embedding_web
 
 
@@ -43,6 +44,16 @@ class NeverReadRequest(JsonRequest):
 
 def response_json(response):
     return json.loads(response.body.decode("utf-8"))
+
+
+def test_persist_embedding_yaml_propagates_atomic_write_failure(monkeypatch):
+    def fail_write(_mutate):
+        raise OSError("synthetic read-only config")
+
+    monkeypatch.setattr(utils, "atomic_update_config_yaml", fail_write)
+
+    with pytest.raises(OSError, match="synthetic read-only config"):
+        embedding_web._persist_embedding_yaml({"backend": "ollama", "enabled": True})
 
 
 @pytest.fixture(autouse=True)

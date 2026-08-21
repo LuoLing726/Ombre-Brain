@@ -40,6 +40,7 @@ def tunnel_routes(monkeypatch, tmp_path):
     monkeypatch.setattr(tunnel.sh, "config", {"buckets_dir": str(tmp_path)})
     monkeypatch.setattr(tunnel, "_tunnel_proc", None)
     monkeypatch.setattr(tunnel, "_tunnel_last_error", "")
+    monkeypatch.delenv("OMBRE_ALLOW_INSECURE_MCP", raising=False)
 
     mcp = FakeMCP()
     tunnel.register(mcp)
@@ -124,6 +125,73 @@ async def test_save_failure_is_reported_and_does_not_claim_persistence(
     assert response.status_code == 500
     payload = _payload(response)
     assert "read-only volume" in payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_no_auth_tunnel_autostart_is_rejected_without_changing_config(
+    tunnel_routes, monkeypatch
+):
+    routes, buckets_dir = tunnel_routes
+    config_path = buckets_dir / ".tunnel_config.json"
+    original = {"token": "existing-token", "auto_start": False}
+    config_path.write_text(json.dumps(original), encoding="utf-8")
+    monkeypatch.setattr(
+        tunnel.sh,
+        "config",
+        {"buckets_dir": str(buckets_dir), "mcp_require_auth": False},
+    )
+
+    response = await routes[("POST", "/api/tunnel/config")](
+        JsonRequest({"auto_start": True})
+    )
+
+    assert response.status_code == 400
+    assert "不能启动公网 Tunnel" in _payload(response)["error"]
+    assert json.loads(config_path.read_text(encoding="utf-8")) == original
+
+
+def test_no_auth_tunnel_is_blocked_before_process_spawn(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        tunnel.sh,
+        "config",
+        {"buckets_dir": str(tmp_path), "mcp_require_auth": False},
+    )
+    monkeypatch.delenv("OMBRE_ALLOW_INSECURE_MCP", raising=False)
+    monkeypatch.setattr(
+        tunnel._subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: pytest.fail("cloudflared must not start"),
+    )
+
+    ok, message = tunnel._start_tunnel("test-token")
+
+    assert ok is False
+    assert "不能启动公网 Tunnel" in message
+
+
+@pytest.mark.asyncio
+async def test_explicit_insecure_override_allows_tunnel_autostart_config(
+    tunnel_routes, monkeypatch
+):
+    routes, buckets_dir = tunnel_routes
+    config_path = buckets_dir / ".tunnel_config.json"
+    config_path.write_text(
+        json.dumps({"token": "existing-token", "auto_start": False}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        tunnel.sh,
+        "config",
+        {"buckets_dir": str(buckets_dir), "mcp_require_auth": False},
+    )
+    monkeypatch.setenv("OMBRE_ALLOW_INSECURE_MCP", "true")
+
+    response = await routes[("POST", "/api/tunnel/config")](
+        JsonRequest({"auto_start": True})
+    )
+
+    assert response.status_code == 200
+    assert json.loads(config_path.read_text(encoding="utf-8"))["auto_start"] is True
 
 
 def test_dashboard_autostart_switch_saves_independently_and_rolls_back_on_error():

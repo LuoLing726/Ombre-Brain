@@ -9,6 +9,7 @@ check, not a cryptographic signature of who created the archive.
 from __future__ import annotations
 
 import hashlib
+import codecs
 import io
 import json
 import os
@@ -19,6 +20,12 @@ import stat
 import tempfile
 from typing import Any
 import zipfile
+
+from .source_store import (
+    HARD_MAX_SOURCE_BYTES,
+    SOURCE_REF_RE,
+    referenced_source_ids_from_markdown,
+)
 
 
 MANIFEST_NAME = "backup_manifest.json"
@@ -37,9 +44,10 @@ MAX_MANIFEST_BYTES = 8 * MIB
 # Production migration has a deliberately smaller attack surface: only the
 # files the importer consumes are accepted, ordinary members are tightly
 # bounded, and total extraction cannot fill a 512 MiB instance's filesystem.
-MIGRATE_MAX_MEMBERS = 9_000
+MIGRATE_MAX_MEMBERS = 20_000
 MIGRATE_MAX_TOTAL_UNCOMPRESSED_BYTES = 512 * MIB
 MIGRATE_MAX_BUCKET_BYTES = 10 * MIB
+MIGRATE_MAX_SOURCE_BYTES = HARD_MAX_SOURCE_BYTES
 MIGRATE_MAX_EXPORT_META_BYTES = 1 * MIB
 MIGRATE_MAX_EMBEDDINGS_DB_BYTES = 512 * MIB
 MIGRATE_MIN_FREE_RESERVE_BYTES = 64 * MIB
@@ -80,6 +88,13 @@ def _migration_member_limit(path: str) -> int:
     parts = PurePosixPath(path).parts
     if len(parts) >= 2 and parts[0] == "buckets" and path.endswith(".md"):
         return MIGRATE_MAX_BUCKET_BYTES
+    if (
+        len(parts) == 2
+        and parts[0] == "sources"
+        and parts[1].endswith(".source")
+        and SOURCE_REF_RE.fullmatch(parts[1][:-len(".source")])
+    ):
+        return MIGRATE_MAX_SOURCE_BYTES
     raise BackupArchiveError(f"迁移包包含不支持的成员: {path}")
 
 
@@ -156,6 +171,111 @@ def _collect_markdown(buckets_dir: str) -> dict[str, bytes]:
     return files
 
 
+def _iter_source_paths(base: Path) -> list[tuple[Path, str]]:
+    """收集内容寻址的证据文件，忽略 sidecar 锁等内部文件。"""
+
+    source_root = base / "_sources"
+    if not source_root.exists():
+        return []
+    if source_root.is_symlink() or not source_root.is_dir():
+        raise BackupArchiveError("原文证据目录不安全")
+
+    result: list[tuple[Path, str]] = []
+    for path in sorted(source_root.iterdir()):
+        if not path.name.endswith(".source"):
+            continue
+        ref = path.name[:-len(".source")]
+        if not SOURCE_REF_RE.fullmatch(ref):
+            raise BackupArchiveError(f"原文证据文件名非法: {path.name}")
+        if path.is_symlink():
+            raise BackupArchiveError(f"拒绝导出符号链接原文证据: {path.name}")
+        try:
+            resolved = path.resolve(strict=True)
+        except OSError as exc:
+            raise BackupArchiveError(f"无法解析原文证据 {path.name}: {exc}") from exc
+        if not resolved.is_file() or not resolved.is_relative_to(source_root.resolve()):
+            raise BackupArchiveError(f"拒绝导出指向证据目录外的文件: {path.name}")
+        result.append((resolved, f"sources/{path.name}"))
+    return result
+
+
+def _collect_sources(base: Path) -> dict[str, bytes]:
+    files: dict[str, bytes] = {}
+    for path, arc_path in _iter_source_paths(base):
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            raise BackupArchiveError(f"无法读取原文证据 {path.name}: {exc}") from exc
+        if len(data) > MIGRATE_MAX_SOURCE_BYTES:
+            raise BackupArchiveError(f"原文证据过大: {path.name}")
+        if _sha256(data) != path.stem.removeprefix("src_"):
+            raise BackupArchiveError(f"原文证据 SHA-256 校验失败: {path.name}")
+        try:
+            data.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise BackupArchiveError(f"原文证据不是 UTF-8: {path.name}") from exc
+        files[arc_path] = data
+    return files
+
+
+def _validate_source_reference_closure(files: dict[str, bytes]) -> None:
+    """Refuse a new backup whose bucket references evidence it does not carry."""
+
+    available = {
+        PurePosixPath(path).name[:-len(".source")]
+        for path in files
+        if path.startswith("sources/") and path.endswith(".source")
+    }
+    referenced: set[str] = set()
+    for path, data in files.items():
+        if not path.startswith("buckets/") or not path.endswith(".md"):
+            continue
+        try:
+            referenced.update(referenced_source_ids_from_markdown(data))
+        except ValueError as exc:
+            raise BackupArchiveError(f"无法验证 {path} 的原文证据引用：{exc}") from exc
+    missing = sorted(referenced - available)
+    if missing:
+        preview = ", ".join(missing[:3])
+        raise BackupArchiveError(
+            f"备份存在 {len(missing)} 个悬空原文证据引用：{preview}"
+        )
+
+
+def _validate_archive_source_reference_closure(archive_path: str) -> None:
+    """Validate the exact Markdown/source bytes written by the streaming export."""
+
+    with zipfile.ZipFile(archive_path, "r") as archive:
+        infos = [(_normalize_member_path(info.filename), info) for info in archive.infolist()]
+        available = {
+            PurePosixPath(path).name[:-len(".source")]
+            for path, _info in infos
+            if path.startswith("sources/") and path.endswith(".source")
+        }
+        referenced: set[str] = set()
+        for path, info in infos:
+            if not path.startswith("buckets/") or not path.endswith(".md"):
+                continue
+            if info.file_size > MIGRATE_MAX_BUCKET_BYTES:
+                raise BackupArchiveError(f"备份成员过大: {path}")
+            with archive.open(info, "r") as handle:
+                data = handle.read(MIGRATE_MAX_BUCKET_BYTES + 1)
+            if len(data) > MIGRATE_MAX_BUCKET_BYTES:
+                raise BackupArchiveError(f"备份成员读取时超过上限: {path}")
+            try:
+                referenced.update(referenced_source_ids_from_markdown(data))
+            except ValueError as exc:
+                raise BackupArchiveError(
+                    f"无法验证 {path} 的原文证据引用：{exc}"
+                ) from exc
+        missing = sorted(referenced - available)
+        if missing:
+            preview = ", ".join(missing[:3])
+            raise BackupArchiveError(
+                f"备份存在 {len(missing)} 个悬空原文证据引用：{preview}"
+            )
+
+
 def _build_manifest(files: dict[str, bytes], *, created_at: str, version: str) -> dict[str, Any]:
     entries = [
         {"path": path, "size": len(data), "sha256": _sha256(data)}
@@ -179,6 +299,8 @@ def build_export_archive(
 ) -> tuple[bytes, dict[str, Any]]:
     """Build a complete in-memory archive or fail without returning a partial one."""
     files = _collect_markdown(buckets_dir)
+    files.update(_collect_sources(Path(buckets_dir).resolve()))
+    _validate_source_reference_closure(files)
     db_bytes = snapshot_sqlite(embedding_db_path)
     if db_bytes:
         files["embeddings.db"] = db_bytes
@@ -212,6 +334,7 @@ def _stream_file_member(
     *,
     source: Path,
     arc_path: str,
+    require_utf8: bool = False,
 ) -> dict[str, Any]:
     """Stream one source file into ZIP while hashing the exact written bytes."""
 
@@ -224,6 +347,7 @@ def _stream_file_member(
         raise BackupArchiveError(f"备份成员过大: {arc_path}")
 
     digest = hashlib.sha256()
+    utf8_decoder = codecs.getincrementaldecoder("utf-8")() if require_utf8 else None
     written = 0
     try:
         with source.open("rb") as input_handle, archive.open(
@@ -234,6 +358,13 @@ def _stream_file_member(
                 if written > member_limit:
                     raise BackupArchiveError(f"备份成员读取时超过上限: {arc_path}")
                 digest.update(chunk)
+                if utf8_decoder is not None:
+                    try:
+                        utf8_decoder.decode(chunk)
+                    except UnicodeDecodeError as exc:
+                        raise BackupArchiveError(
+                            f"原文证据不是 UTF-8: {arc_path}"
+                        ) from exc
                 output_handle.write(chunk)
                 archive_position = getattr(getattr(archive, "fp", None), "tell", None)
                 if callable(archive_position) and archive_position() > MAX_ARCHIVE_BYTES:
@@ -244,6 +375,11 @@ def _stream_file_member(
         raise BackupArchiveError(f"无法读取导出文件 {arc_path}: {exc}") from exc
     if written != declared_size:
         raise BackupArchiveError(f"导出期间文件大小发生变化: {arc_path}")
+    if utf8_decoder is not None:
+        try:
+            utf8_decoder.decode(b"", final=True)
+        except UnicodeDecodeError as exc:
+            raise BackupArchiveError(f"原文证据不是 UTF-8: {arc_path}") from exc
     return {"path": arc_path, "size": written, "sha256": digest.hexdigest()}
 
 
@@ -308,6 +444,20 @@ def build_export_archive_file(
                     )
                 )
 
+            for source_path, arc_path in _iter_source_paths(base):
+                entry = _stream_file_member(
+                    archive,
+                    source=source_path,
+                    arc_path=arc_path,
+                    require_utf8=True,
+                )
+                expected_digest = source_path.stem.removeprefix("src_")
+                if entry["sha256"] != expected_digest:
+                    raise BackupArchiveError(
+                        f"原文证据 SHA-256 校验失败: {source_path.name}"
+                    )
+                record(entry)
+
             if _snapshot_sqlite_to_file(embedding_db_path, snapshot_path):
                 record(
                     _stream_file_member(
@@ -353,6 +503,7 @@ def build_export_archive_file(
                 raise BackupArchiveError("backup_manifest.json 过大")
             archive.writestr(MANIFEST_NAME, manifest_bytes)
 
+        _validate_archive_source_reference_closure(archive_path)
         if os.path.getsize(archive_path) > MAX_ARCHIVE_BYTES:
             raise BackupArchiveError("备份压缩后超过 512 MiB 上限")
         return archive_path, manifest
@@ -605,7 +756,7 @@ def extract_backup_archive_file(
             for index, (path, info) in enumerate(sorted(infos.items())):
                 path_limit = _migration_member_limit(path)
                 suffix = Path(path).suffix.lower()
-                if suffix not in {".md", ".db", ".json"}:
+                if suffix not in {".md", ".db", ".json", ".source"}:
                     suffix = ".bin"
                 local_name = (
                     f"{index:05d}-"

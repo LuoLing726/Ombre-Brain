@@ -29,13 +29,24 @@ breath 是「我睁眼看看自己记得什么」。这个文件根据参数把�
 
 from typing import Optional
 
+from utils import parse_bool
+
 from .. import _runtime as rt
-from .._common import check_metadata_size, check_query_size
+from .._common import (
+    check_metadata_size,
+    check_query_size,
+)
 from .catalog import surface_catalog
 from .feel import surface_feels
 from .importance import surface_by_importance
-from .surface import surface_default
+from .surface import surface_default, surface_plans
 from .search import surface_search
+
+
+async def _with_deletion_requests(body: str) -> str:
+    store = getattr(rt, "deletion_requests", None)
+    batch = await store.render_pending_batch() if store is not None else ""
+    return f"{batch}\n\n{body}" if batch and body else (batch or body)
 
 
 async def dispatch(
@@ -50,6 +61,7 @@ async def dispatch(
     catalog: Optional[bool] = False,
     date_from: Optional[str] = "",
     date_to: Optional[str] = "",
+    quotes: Optional[bool] = False,
 ) -> str:
     # --- Null-safe coercion ---
     query = "" if query is None else str(query)
@@ -69,6 +81,7 @@ async def dispatch(
         catalog = False
     date_from = "" if date_from is None else str(date_from)
     date_to = "" if date_to is None else str(date_to)
+    quotes = parse_bool(quotes, default=False)
 
     query_err = check_query_size(query)
     if query_err:
@@ -91,6 +104,7 @@ async def dispatch(
         "catalog": catalog,
         "date_from": date_from,
         "date_to": date_to,
+        "quotes": quotes,
     })
     await rt.decay_engine.ensure_started()
 
@@ -102,54 +116,63 @@ async def dispatch(
     if max_tokens <= 0:
         max_tokens = default_tokens
     max_results = min(max_results, 50)
-    max_tokens = min(max_tokens, 20000)
+    max_tokens = min(max_tokens, 40000)
     tag_filter = [t.strip() for t in tags.split(",") if t.strip()]
+    memory_max_tokens = max_tokens
 
     # --- catalog 目录模式：最先短路，0 LLM、只读元数据、每桶一行 ---
     # 开新窗省 token 的推荐姿势：先 breath(catalog=True) 看目录，
     # 再 breath(query=...) 精准拉取正文。
     if catalog:
         domain_filter = [d.strip() for d in domain.split(",") if d.strip()]
-        return await surface_catalog(
+        return await _with_deletion_requests(await surface_catalog(
             domain_filter=domain_filter or None,
             tag_filter=tag_filter,
             max_results=max_results,
-        )
+        ))
 
     # --- 解析 tags 过滤；feel/__feel__ 映射到 feel 通道 ---
     if any(t in ("feel", "__feel__") for t in tag_filter):
         domain = "feel"
         tag_filter = [t for t in tag_filter if t not in ("feel", "__feel__")]
 
-    # --- Feel 通道优先：即使无 query 也直接拉 feel ---
+    # --- Feel 通道：3.0.0 起必须带关键词，不再全量返回（见 feel.py） ---
     if domain.strip().lower() == "feel":
-        return await surface_feels(max_tokens=max_tokens)
+        return await _with_deletion_requests(
+            await surface_feels(query=query, max_tokens=memory_max_tokens)
+        )
+
+    # --- Plan 通道：与 feel 同构。plan 不参与普通浮现，没有这个分流时
+    # domain="plan" 会落到下面的浮现模式，返回核心准则而不是 plan。 ---
+    if domain.strip().lower() == "plan":
+        return await _with_deletion_requests(await surface_plans(max_tokens=memory_max_tokens))
 
     # --- importance_min 模式：跳过语义，按 importance 降序 ---
     if importance_min >= 1:
-        return await surface_by_importance(
+        return await _with_deletion_requests(await surface_by_importance(
             importance_min=importance_min,
-            max_tokens=max_tokens,
+            max_tokens=memory_max_tokens,
             tag_filter=tag_filter,
-        )
+        ))
 
     # --- 无 query：浮现模式 ---
     if not query or not query.strip():
-        return await surface_default(
+        return await _with_deletion_requests(await surface_default(
             max_results=max_results,
-            max_tokens=max_tokens,
+            max_tokens=memory_max_tokens,
             tag_filter=tag_filter,
-        )
+        ))
 
     # --- 有 query：检索模式 ---
-    return await surface_search(
+    return await _with_deletion_requests(await surface_search(
         query=query,
         max_results=max_results,
-        max_tokens=max_tokens,
+        max_tokens=memory_max_tokens,
         domain=domain,
         valence=valence,
         arousal=arousal,
         tag_filter=tag_filter,
         date_from=date_from,
         date_to=date_to,
-    )
+        with_quotes=quotes,
+    ))

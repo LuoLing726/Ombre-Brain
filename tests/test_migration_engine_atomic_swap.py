@@ -9,7 +9,9 @@
 额外记录目标签名（backend:model:dim），目标一变就整个重来，不会把不兼容的
 旧向量当成「已完成」直接换进主库。
 """
+import ast
 import os
+from pathlib import Path
 
 import pytest
 
@@ -24,6 +26,11 @@ from migration_engine import (
     status_path_for,
     target_signature,
 )
+from web import embedding as web_embedding
+import utils
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class FakeTargetEngine:
@@ -125,6 +132,74 @@ async def test_failed_migration_never_touches_live_db(tmp_path):
     assert status["phase"] == "failed"
     assert status["failed_count"] >= 1
     assert os.path.exists(checkpoint_path_for(buckets_dir)), "失败时应保留 checkpoint 供下次续传"
+
+
+@pytest.mark.asyncio
+async def test_post_swap_publish_failure_is_reported_in_status(tmp_path):
+    buckets_dir = str(tmp_path / "buckets")
+    os.makedirs(buckets_dir, exist_ok=True)
+    live_db = str(tmp_path / "embeddings.db")
+    with open(live_db, "w", encoding="utf-8") as f:
+        f.write("OLD-LIVE-CONTENT\n")
+
+    target_engine = FakeTargetEngine(staging_db_path_for(live_db))
+
+    async def fetch_buckets():
+        return [("b1", "content 1")]
+
+    def fail_publish(success):
+        assert success is True
+        raise OSError("simulated config publish failure")
+
+    cfg = MigrationConfig(
+        buckets_dir=buckets_dir,
+        db_path=live_db,
+        target_backend="api",
+        target_model="test-model",
+        target_dim=8,
+        target_engine=target_engine,
+        fetch_buckets=fetch_buckets,
+    )
+
+    await _run_migration(cfg, on_complete=fail_publish)
+
+    status = read_status(status_path_for(buckets_dir))
+    assert status["phase"] == "publish_failed"
+    assert "运行态/配置发布失败" in status["error"]
+    assert "simulated config publish failure" in status["error"]
+    with open(live_db, "r", encoding="utf-8") as f:
+        assert "b1" in f.read(), "publish 失败不应伪装成原子替换未发生"
+
+
+def test_embedding_yaml_persistence_failure_propagates(monkeypatch):
+    def fail_persist(_mutator):
+        raise OSError("simulated yaml write failure")
+
+    monkeypatch.setattr(utils, "atomic_update_config_yaml", fail_persist)
+
+    with pytest.raises(OSError, match="simulated yaml write failure"):
+        web_embedding._persist_embedding_yaml({"model": "test-model"})
+
+
+def test_embedding_package_mode_uses_parent_migration_module():
+    tree = ast.parse(
+        (ROOT / "src" / "web" / "embedding.py").read_text(encoding="utf-8")
+    )
+    migration_imports = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == "migration_engine"
+    ]
+
+    assert not [node for node in migration_imports if node.level == 1]
+    assert len([node for node in migration_imports if node.level == 2]) >= 4
+
+
+def test_dashboard_treats_publish_failure_as_visible_terminal_state():
+    dashboard = (ROOT / "frontend" / "dashboard.html").read_text(encoding="utf-8")
+
+    assert "s.phase === 'publish_failed'" in dashboard
+    assert "['completed', 'failed', 'publish_failed'].includes(d.status.phase)" in dashboard
 
 
 @pytest.mark.asyncio

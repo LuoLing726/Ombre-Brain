@@ -1,6 +1,10 @@
+import ast
 import asyncio
 import json
+import shutil
+import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -21,6 +25,7 @@ from server_app import (
 )
 
 
+# 主连接器 /mcp：记忆本身的动作。
 EXPECTED_PUBLIC_MCP_TOOLS = (
     "breath",
     "breath_search",
@@ -33,9 +38,16 @@ EXPECTED_PUBLIC_MCP_TOOLS = (
     "release",
     "pulse",
     "plan",
-    "letter_write",
-    "letter_read",
+    "feel",
     "I",
+)
+
+# /mcp-extra：信件。写信是一个行为，不是一段记忆——它有收件人、有时间锁，
+# 时间方向和记忆相反，所以自 3.2.0 起从主连接器挪出来。
+EXPECTED_EXTRA_MCP_TOOLS = (
+    "letter_write",
+    "letter_lock_update",
+    "letter_read",
 )
 
 
@@ -175,6 +187,68 @@ async def test_json_accept_shim_preserves_explicit_or_non_mcp_accept(path, accep
 
 
 @pytest.mark.asyncio
+async def test_letter_tools_live_on_the_extra_connector_only():
+    """信件三工具只在 /mcp-extra，主连接器一个都不该有。
+
+    分开不是为了好看：工具数量本身会伤害可用性——claude.ai 在工具过多时
+    改用 tool_search 延迟加载，按描述搜工具、命中带随机性。信是低频且语义
+    独立的一层，占主连接器的位纯属浪费。
+    """
+    import server
+
+    main_names = {tool.name for tool in await server.mcp.list_tools()}
+    extra_names = [tool.name for tool in await server.mcp_extra.list_tools()]
+
+    assert extra_names == list(EXPECTED_EXTRA_MCP_TOOLS)
+    assert main_names.isdisjoint(EXPECTED_EXTRA_MCP_TOOLS)
+    assert server.mcp_extra.settings.streamable_http_path == "/mcp-extra"
+    # 两个连接器的传输设置必须一致，否则同一个客户端连两条路会有两种行为
+    assert server.mcp_extra.settings.json_response is True
+    assert server.mcp_extra.settings.stateless_http is True
+
+
+def test_extra_connector_rejects_unknown_arguments():
+    """严格参数校验必须跟着工具走到新端点。
+
+    否则 /mcp-extra 会成为一条旁路：参数拼错照样返回成功，而 letter_write
+    是能创建记忆的——写工具在未应用目标字段时仍然落库，是最难发现的那类错。
+    """
+    import server
+
+    for name in EXPECTED_EXTRA_MCP_TOOLS:
+        tool = server.mcp_extra._tool_manager.get_tool(name)
+        assert tool is not None, name
+        assert tool.fn_metadata.arg_model.model_config.get("extra") == "forbid", name
+
+
+def test_extra_connector_route_is_mounted_and_guarded():
+    """/mcp-extra 必须真的挂上路由，并且被中间件的端点匹配器认出来。
+
+    只搬路由不搬 session manager 的话，这条路径会在第一次请求时才炸；
+    匹配器不认它的话，它会绕过体积限制、CSRF 与鉴权。
+    """
+    import server
+    from web.request_limits import is_mcp_endpoint_path
+
+    app = build_http_app(
+        server.mcp,
+        "streamable-http",
+        settings=HTTPRuntimeSettings(
+            auth_required=False,
+            max_request_bytes=DEFAULT_MAX_MCP_REQUEST_BYTES,
+        ),
+        token_validator=lambda *_args, **_kwargs: False,
+        lifecycle=RuntimeLifecycle(logger=RecordingLogger()),
+        mcp_extra=server.mcp_extra,
+    )
+    paths = {getattr(route, "path", None) for route in app.router.routes}
+
+    assert "/mcp-extra" in paths
+    assert "/mcp" in paths
+    assert is_mcp_endpoint_path("/mcp-extra")
+
+
+@pytest.mark.asyncio
 async def test_kelivo_compatible_stateless_json_handshake_lists_all_tools():
     """Kelivo 风格多请求握手不应依赖会话头或 SSE 解析。"""
 
@@ -283,85 +357,20 @@ async def test_kelivo_compatible_stateless_json_handshake_lists_all_tools():
                 assert all(isinstance(tool.get("inputSchema"), dict) for tool in tools)
 
 
-@pytest.mark.asyncio
-async def test_legacy_sse_official_client_lists_all_tools():
-    """Streamable HTTP 的兼容改动不能破坏旧版 SSE 发现路径。"""
+def test_legacy_sse_transport_is_rejected():
+    """2026-08-09 起 legacy SSE 传输下线：build_http_app 必须明确拒绝，不能悄悄放行。"""
 
-    import socket
-
-    import uvicorn
-    from mcp import ClientSession
-    from mcp.client.sse import sse_client
-
-    import server
-
-    app = build_http_app(
-        server.mcp,
-        "sse",
-        settings=HTTPRuntimeSettings(
-            auth_required=False,
-            max_request_bytes=DEFAULT_MAX_MCP_REQUEST_BYTES,
-        ),
-        token_validator=lambda *_args, **_kwargs: False,
-        lifecycle=RuntimeLifecycle(logger=RecordingLogger()),
-    )
-    requests = []
-
-    async def recording_app(scope, receive, send):
-        if scope["type"] == "http":
-            requests.append((scope["method"], scope["path"]))
-        await app(scope, receive, send)
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("127.0.0.1", 0))
-    sock.listen()
-    port = sock.getsockname()[1]
-    uvicorn_server = uvicorn.Server(
-        uvicorn.Config(
-            recording_app,
-            log_level="warning",
-            lifespan="on",
+    with pytest.raises(ValueError, match="sse"):
+        build_http_app(
+            object(),
+            "sse",
+            settings=HTTPRuntimeSettings(
+                auth_required=False,
+                max_request_bytes=DEFAULT_MAX_MCP_REQUEST_BYTES,
+            ),
+            token_validator=lambda *_args, **_kwargs: False,
+            lifecycle=RuntimeLifecycle(logger=RecordingLogger()),
         )
-    )
-    server_task = asyncio.create_task(uvicorn_server.serve(sockets=[sock]))
-
-    async def wait_until_started():
-        while not uvicorn_server.started:
-            if server_task.done():
-                await server_task
-            await asyncio.sleep(0.01)
-
-    try:
-        await asyncio.wait_for(wait_until_started(), timeout=10)
-        async with sse_client(
-            f"http://127.0.0.1:{port}/sse",
-            timeout=5,
-            sse_read_timeout=10,
-        ) as (read_stream, write_stream):
-            async with ClientSession(read_stream, write_stream) as session:
-                initialized = await asyncio.wait_for(
-                    session.initialize(),
-                    timeout=10,
-                )
-                listed = await asyncio.wait_for(
-                    session.list_tools(),
-                    timeout=10,
-                )
-
-        assert initialized.protocolVersion
-        assert [tool.name for tool in listed.tools] == list(
-            EXPECTED_PUBLIC_MCP_TOOLS
-        )
-        assert ("GET", "/sse") in requests
-        assert any(
-            method == "POST" and path.rstrip("/") == "/messages"
-            for method, path in requests
-        )
-    finally:
-        uvicorn_server.should_exit = True
-        await asyncio.wait_for(server_task, timeout=10)
-        sock.close()
 
 
 @pytest.mark.asyncio
@@ -853,14 +862,18 @@ async def test_auth_middleware_ignores_forwarded_resource_from_untrusted_peer(
 
 
 @pytest.mark.asyncio
-async def test_auth_middleware_does_not_challenge_retired_mcp_extra_path():
+async def test_auth_middleware_challenges_restored_mcp_extra_path():
+    """/mcp-extra 自 3.2.0 恢复为信件连接器，必须和 /mcp 一样受鉴权保护。
+
+    2.8.5 到 3.1.0 之间它是退役路径，中间件放行让它落到 router 去拿 404。
+    恢复之后如果还放行，就等于开了一条免鉴权的写入旁路——letter_write
+    是能创建记忆的。
+    """
     downstream = RecordingASGIApp()
     middleware = MCPAuthMiddleware(
         downstream,
         auth_required=True,
-        token_validator=lambda *_args, **_kwargs: pytest.fail(
-            "retired routes must reach the router without OAuth validation"
-        ),
+        token_validator=lambda *_args, **_kwargs: False,
     )
     messages = []
     scope = {
@@ -872,8 +885,9 @@ async def test_auth_middleware_does_not_challenge_retired_mcp_extra_path():
 
     await middleware(scope, _empty_receive, _collect_into(messages))
 
-    assert downstream.scopes == [scope]
-    assert messages[0]["status"] == 204
+    # 未通过鉴权：不得进入下游 router，且必须回 401 challenge
+    assert downstream.scopes == []
+    assert messages[0]["status"] == 401
 
 
 @pytest.mark.asyncio
@@ -1085,13 +1099,9 @@ async def test_runtime_lifespan_composes_with_parent_lifespan():
     ]
 
 
-@pytest.mark.parametrize("transport", ["streamable-http", "sse"])
-def test_build_http_app_uses_same_managed_stack_for_both_http_transports(transport):
+def test_build_http_app_uses_the_managed_stack():
     class FakeMCP:
         def streamable_http_app(self):
-            return Starlette()
-
-        def sse_app(self):
             return Starlette()
 
     lifecycle = RuntimeLifecycle(logger=RecordingLogger())
@@ -1103,7 +1113,7 @@ def test_build_http_app_uses_same_managed_stack_for_both_http_transports(transpo
 
     app = build_http_app(
         FakeMCP(),
-        transport,
+        "streamable-http",
         settings=settings,
         token_validator=lambda *_args, **_kwargs: False,
         lifecycle=lifecycle,
@@ -1117,10 +1127,8 @@ def test_build_http_app_uses_same_managed_stack_for_both_http_transports(transpo
         "ManagementRequestBodyLimitMiddleware",
         "MCPAuthMiddleware",
         "NgrokHeaderMiddleware",
+        "MCPJSONAcceptShim",
     }
-    assert ("MCPJSONAcceptShim" in middleware_names) is (
-        transport == "streamable-http"
-    )
     csrf_middleware = next(
         item
         for item in app.user_middleware
@@ -1200,3 +1208,90 @@ def test_build_http_app_rejects_stdio_transport():
             token_validator=lambda *_args, **_kwargs: False,
             lifecycle=RuntimeLifecycle(logger=RecordingLogger()),
         )
+
+
+def test_stdio_runtime_lifecycle_owns_embedding_outbox():
+    source_path = Path(__file__).resolve().parents[1] / "src" / "server.py"
+    module = ast.parse(source_path.read_text(encoding="utf-8"))
+
+    stdio_branch = None
+    for node in ast.walk(module):
+        if not isinstance(node, ast.If) or not isinstance(node.test, ast.Compare):
+            continue
+        test = node.test
+        if (
+            isinstance(test.left, ast.Name)
+            and test.left.id == "transport"
+            and any(
+                isinstance(value, ast.Constant) and value.value == "stdio"
+                for value in test.comparators
+            )
+        ):
+            stdio_branch = node.body
+            break
+
+    assert stdio_branch is not None
+    lifecycle_calls = [
+        item
+        for statement in stdio_branch
+        for item in ast.walk(statement)
+        if isinstance(item, ast.Call)
+        and isinstance(item.func, ast.Name)
+        and item.func.id == "RuntimeLifecycle"
+    ]
+    assert len(lifecycle_calls) == 1
+
+    keywords = {keyword.arg: keyword.value for keyword in lifecycle_calls[0].keywords}
+    outbox = keywords.get("embedding_outbox")
+    assert isinstance(outbox, ast.Name)
+    assert outbox.id == "embedding_outbox"
+
+
+@pytest.mark.asyncio
+async def test_stdio_mcp_server_resets_existing_boot_marker_after_successful_handshake(
+    tmp_path,
+):
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    runtime_root = tmp_path / "runtime"
+    shutil.copytree(Path(__file__).resolve().parents[1] / "src", runtime_root / "src")
+    shutil.copy(Path(__file__).resolve().parents[1] / "VERSION", runtime_root / "VERSION")
+
+    buckets_dir = tmp_path / "buckets"
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        json.dumps(
+            {
+                "transport": "stdio",
+                "buckets_dir": str(buckets_dir),
+                "embedding": {"enabled": False},
+            }
+        ),
+        encoding="utf-8",
+    )
+    marker = runtime_root / ".boot_fails"
+    marker.write_text("1\n", encoding="utf-8")
+
+    server = StdioServerParameters(
+        command=sys.executable,
+        args=[str(runtime_root / "src" / "server.py")],
+        cwd=runtime_root,
+        env={
+            "OMBRE_CONFIG_PATH": str(config_path),
+            "OMBRE_BUCKETS_DIR": str(buckets_dir),
+            "OMBRE_LOG_DIR": str(tmp_path / "logs"),
+            "PYTHONPYCACHEPREFIX": str(tmp_path / "pycache"),
+            "PYTHONIOENCODING": "utf-8",
+            "PYTHONUTF8": "1",
+        },
+    )
+
+    async with stdio_client(server) as (read_stream, write_stream):
+        async with ClientSession(read_stream, write_stream) as session:
+            initialized = await session.initialize()
+            listed = await session.list_tools()
+
+    assert initialized.protocolVersion
+    assert [tool.name for tool in listed.tools] == list(EXPECTED_PUBLIC_MCP_TOOLS)
+    assert marker.read_text(encoding="utf-8") == "0"

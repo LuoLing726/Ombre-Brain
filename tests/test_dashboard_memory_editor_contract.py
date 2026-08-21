@@ -70,7 +70,12 @@ async def test_bucket_detail_preserves_raw_content_and_separates_display_text(
     raw_content = "before [[Target|Alias]] and [[Target#Section]] after"
     bucket = {
         "id": "memory-1",
-        "metadata": {"name": "Linked memory", "type": "dynamic"},
+        "metadata": {
+            "name": "Linked memory",
+            "type": "dynamic",
+            "meaning": ["first meaning", "second meaning"],
+            "imported": True,
+        },
         "content": raw_content,
     }
     manager = FakeBucketManager(bucket)
@@ -94,6 +99,11 @@ async def test_bucket_detail_preserves_raw_content_and_separates_display_text(
     )
     assert detail["content"] == raw_content
     assert detail["display_content"] == listed["content_preview"]
+    assert detail["metadata"]["meaning"] == [
+        "first meaning",
+        "second meaning",
+    ]
+    assert listed["imported"] is True
 
 
 def test_dashboard_uses_display_text_for_preview_and_raw_content_for_editor():
@@ -105,6 +115,66 @@ def test_dashboard_uses_display_text_for_preview_and_raw_content_for_editor():
     assert "'<div class=\"detail-content\">' + esc(b.content)" not in source
 
 
+def test_dashboard_names_the_calculated_score_as_read_only_activity():
+    source = _dashboard_function("showDetail", "bucketPin")
+
+    assert "活跃度分 / Activity score" in source
+    assert "权重分 / Weight" not in source
+    assert "b.score.toFixed(4)" in source
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is unavailable")
+def test_dashboard_detail_renders_meaning_as_escaped_quote_blocks():
+    html = DASHBOARD.read_text(encoding="utf-8")
+    normalize_source = _dashboard_function(
+        "normalizeMeaningItems", "renderMeaningHtml"
+    )
+    render_start = html.index("function renderMeaningHtml(")
+    render_end = html.index("async function searchBuckets(", render_start)
+    render_source = html[render_start:render_end]
+    detail_source = _dashboard_function("showDetail", "bucketPin")
+    script = """
+function esc(value) {
+  return String(value == null ? '' : value).replace(/[&<>\"']/g, function(char) {
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[char];
+  });
+}
+""" + normalize_source + render_source + """
+const many = renderMeaningHtml([
+  '  first meaning  ',
+  '<img src=x onerror=alert(1)>',
+  '',
+  'second meaning',
+]);
+const legacy = renderMeaningHtml('  legacy string meaning  ');
+process.stdout.write(JSON.stringify({many, legacy, empty: renderMeaningHtml([])}));
+"""
+    completed = subprocess.run(
+        [shutil.which("node"), "-e", script],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    rendered = json.loads(completed.stdout)
+
+    assert rendered["many"].count('class="meaning-quote"') == 3
+    assert rendered["many"].index("first meaning") < rendered["many"].index(
+        "second meaning"
+    )
+    assert "&lt;img src=x onerror=alert(1)&gt;" in rendered["many"]
+    assert "<img" not in rendered["many"]
+    assert "legacy string meaning" in rendered["legacy"]
+    assert rendered["empty"] == ""
+    assert 'class="meaning-block"' in rendered["many"]
+    assert ".meaning-block" in html
+    assert "border-left: 3px solid var(--accent);" in html
+    assert "var meaningHtml = renderMeaningHtml(meta.meaning);" in detail_source
+    assert detail_source.index("whyHtml +") < detail_source.index(
+        "meaningHtml +"
+    ) < detail_source.index("'<div class=\"detail-meta\">'")
+
+
 def test_dashboard_detail_does_not_render_an_editor_for_failed_bucket_fetch():
     source = _dashboard_function("showDetail", "bucketPin")
 
@@ -114,6 +184,63 @@ def test_dashboard_detail_does_not_render_an_editor_for_failed_bucket_fetch():
     assert "const generation = ++detailLoadGeneration;" in source
     assert "if (generation !== detailLoadGeneration) return false;" in source
     assert source.index("if (!res.ok)") < source.index("renderEditForm(")
+
+
+def test_github_restore_surfaces_legacy_source_evidence_warning():
+    source = _dashboard_function("runGithubImport", "_runBackfillSilent")
+
+    assert "d.integrity_warning" in source
+    assert "esc(d.integrity_warning)" in source
+    assert "var(--negative)" in source
+    assert "d.buckets_imported" in source
+    assert "d.sources_imported" in source
+
+
+def test_status_banner_tracks_responsive_sticky_header_height():
+    html = DASHBOARD.read_text(encoding="utf-8")
+    source = _dashboard_function(
+        "syncStatusBannerOffset", "watchStatusBannerOffset"
+    )
+    watcher = _dashboard_function(
+        "watchStatusBannerOffset", "renderStatusBannerCard"
+    )
+
+    assert "top: var(--ob-header-height, 96px)" in html
+    assert "getBoundingClientRect().height" in source
+    assert "--ob-header-height" in source
+    assert "new ResizeObserver(syncStatusBannerOffset)" in watcher
+    assert "window.addEventListener('resize', syncStatusBannerOffset)" in watcher
+
+
+def test_dashboard_has_an_intermediate_pc_responsive_layout():
+    html = DASHBOARD.read_text(encoding="utf-8")
+
+    breakpoint = "@media (min-width: 769px) and (max-width: 1500px)"
+    assert breakpoint in html
+    responsive = html[html.index(breakpoint) :]
+
+    assert 'grid-template-areas:' in responsive
+    assert '"title meta meta"' in responsive
+    assert '"search search actions"' in responsive
+    assert 'grid-template-columns: repeat(6, minmax(0, 1fr))' in responsive
+    assert 'white-space: nowrap' in responsive
+    assert '.tab-spacer { display: none; }' in responsive
+    assert 'max-width: min(220px, 100%)' in html
+    assert '#owner-badge-text {' in html
+    assert 'text-overflow: ellipsis' in html
+
+
+def test_mobile_responsive_overrides_follow_the_retro_theme_layer():
+    html = DASHBOARD.read_text(encoding="utf-8")
+
+    retro_layer = html.index("RETRO HANDHELD CONSOLE LAYER")
+    final_mobile_override = html.rindex("@media (max-width: 768px)")
+
+    assert final_mobile_override > retro_layer
+    responsive = html[final_mobile_override:]
+    assert 'grid-template-columns: repeat(3, minmax(0, 1fr))' in responsive
+    assert '.header-actions button {' in responsive
+    assert 'font-size: 0 !important' in responsive
 
 
 def test_editor_preserves_special_and_future_bucket_types():
@@ -135,8 +262,16 @@ def test_editor_preserves_special_and_future_bucket_types():
 
 
 def test_editor_submits_metadata_using_storage_field_names():
+    render_source = _dashboard_function("renderEditForm", "syncEditPinConstraints")
     source = _dashboard_function("bucketSaveEdit", "maybeShowOnboarding")
 
+    assert 'id="edit-title"' in render_source
+    assert 'maxlength="120"' in render_source
+    assert "meta.title || fallbackTitle" in render_source
+    assert "data-dirty=\"0\"" in render_source
+    assert "oninput=\"this.dataset.dirty='1'\"" in render_source
+    assert "title: document.getElementById('edit-title').value" not in source
+    assert "if (titleEl && titleEl.dataset.dirty === '1') body.title" in source
     assert "dont_surface: document.getElementById('edit-dont-surface').checked" in source
     assert "why_remembered: document.getElementById('edit-why').value" in source
     assert "if (weightEl) body.weight = parseFloat(weightEl.value) / 100" in source
@@ -198,6 +333,27 @@ def test_imported_memory_cards_open_the_full_editor_and_refresh_after_save():
     assert save_source.index("if (!r.ok)") < save_source.index(
         "await loadImportResults({preserveScroll:true, scrollTop:importScrollTop});"
     ) < save_source.index("} catch (e) {")
+
+
+def test_import_ui_marks_provenance_refreshes_list_and_supports_pagination():
+    html = DASHBOARD.read_text(encoding="utf-8")
+    activate_source = _dashboard_function("activateDashboardTab", "doSearch")
+    paint_source = _dashboard_function("_paintBuckets", "_localBucketMatches")
+    detail_source = _dashboard_function("showDetail", "bucketPin")
+    update_source = _dashboard_function("updateImportUI", "pauseImport")
+    import_source = _dashboard_function(
+        "loadImportResults", "openImportedBucketEditor"
+    )
+
+    assert "if (target === 'list') pending.push(loadBuckets());" in activate_source
+    assert "b.imported ?" in paint_source
+    assert "被导入" in paint_source
+    assert "导入来源 / Imported" in detail_source
+    assert "loadBuckets();" in update_source
+    assert "&offset=" in import_source
+    assert "data.has_more" in import_source
+    assert "被导入" in import_source
+    assert 'id="import-results-more"' in html
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="Node.js is unavailable")

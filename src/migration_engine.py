@@ -136,7 +136,7 @@ def checkpoint_path_for(buckets_dir: str) -> str:
 
 def _empty_status() -> dict[str, Any]:
     return {
-        "phase": "idle",      # idle | running | completed | failed
+        "phase": "idle",      # idle | running | completed | failed | publish_failed
         "total": 0,
         "done": 0,
         "failed_count": 0,
@@ -430,29 +430,7 @@ async def _run_migration(
 
     finished_at = time.strftime("%Y-%m-%dT%H:%M:%S")
     success = all_done and not swap_error
-    final_phase = "completed" if success else "failed"
-    if swap_error:
-        final_msg = f"迁移全部完成但原子替换主库失败，向量仍留在暂存文件：{swap_error}"
-    else:
-        final_msg = f"迁移完成：{len(done_ids)} 成功 / {failed_count} 失败"
-    tail = []
-    if failed_count > 0 or swap_error:
-        # 失败时附 log + 引导提示
-        tail = _tail_errors_log(cfg.buckets_dir)
-
-    cur = read_status(status_path)
-    cur.update({
-        "phase": final_phase,
-        "current_id": "",
-        "done": len(done_ids),
-        "failed_count": failed_count if not swap_error else max(failed_count, 1),
-        "failed_items": failed_items,
-        "finished_at": finished_at,
-        "message": final_msg,
-        "error": swap_error,
-        "tail_log": tail,
-    })
-    write_status(status_path, cur)
+    publish_errors: list[str] = []
 
     # 成功后把 embeddings_meta 更新为目标后端的 model/dim，
     # 否则 db_meta 还是旧值（如 gemini/768），重启会误报 OB-W005 维度不一致。
@@ -462,6 +440,7 @@ async def _run_migration(
             cfg.target_engine._write_meta("vector_dim", str(cfg.target_dim or 0))
         except Exception as e:
             logger.warning(f"[migration] update meta failed: {e}")
+            publish_errors.append(f"元数据发布失败: {type(e).__name__}: {e}")
 
     # 完成后清掉 checkpoint（下次切换从头开始）——只有真正 swap 成功才清，
     # swap 失败时必须留着，好让下次重试从断点续传，而不是把 staging db 里
@@ -478,6 +457,41 @@ async def _run_migration(
             on_complete(success)
         except Exception as e:
             logger.warning(f"[migration] on_complete callback failed: {e}")
+            if success:
+                publish_errors.append(
+                    f"运行态/配置发布失败: {type(e).__name__}: {e}"
+                )
+
+    final_phase = "completed" if success else "failed"
+    if swap_error:
+        final_msg = f"迁移全部完成但原子替换主库失败，向量仍留在暂存文件：{swap_error}"
+        final_error = swap_error
+    elif success and publish_errors:
+        final_phase = "publish_failed"
+        final_error = "; ".join(publish_errors)
+        final_msg = f"向量主库已替换，但迁移结果发布未完整完成：{final_error}"
+    else:
+        final_msg = f"迁移完成：{len(done_ids)} 成功 / {failed_count} 失败"
+        final_error = ""
+
+    tail = []
+    if failed_count > 0 or swap_error or publish_errors:
+        # 失败时附 log + 引导提示
+        tail = _tail_errors_log(cfg.buckets_dir)
+
+    cur = read_status(status_path)
+    cur.update({
+        "phase": final_phase,
+        "current_id": "",
+        "done": len(done_ids),
+        "failed_count": failed_count if not swap_error else max(failed_count, 1),
+        "failed_items": failed_items,
+        "finished_at": finished_at,
+        "message": final_msg,
+        "error": final_error,
+        "tail_log": tail,
+    })
+    write_status(status_path, cur)
 
 
 def start_migration(

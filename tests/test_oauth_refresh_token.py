@@ -68,6 +68,17 @@ def test_oauth_authorize_page_exposes_progress_timeout_and_trace_id():
     assert "诊断编号" in html
 
 
+def test_oauth_log_fields_remove_control_characters_and_limit_length():
+    value = "trace\r\n\t伪造\u2028" + "x" * 40
+
+    sanitized = oauth_mod._oauth_log_field(value, 24)
+
+    assert len(sanitized) == 24
+    assert all(char.isprintable() for char in sanitized)
+    assert "\r" not in sanitized
+    assert "\n" not in sanitized
+
+
 def _fresh_oauth_routes(monkeypatch, tmp_path, *, auth_required=True):
     oauth_mod._oauth_clients.clear()
     oauth_mod._oauth_codes.clear()
@@ -549,6 +560,27 @@ async def test_oauth_registration_allows_https_loopback_and_native_callbacks(
 
 
 @pytest.mark.asyncio
+async def test_oauth_registration_rejects_redirect_uri_total_budget(
+    oauth_routes, monkeypatch
+):
+    monkeypatch.setattr(oauth_mod, "_MAX_REDIRECT_URIS_TOTAL_CHARS", 80)
+    callbacks = [
+        "https://client.example/callback/" + ("a" * 20),
+        "https://client.example/callback/" + ("b" * 20),
+    ]
+
+    response = await oauth_routes[("POST", "/oauth/register")](
+        JsonRequest({"redirect_uris": callbacks})
+    )
+
+    assert response.status_code == 400
+    payload = _payload(response)
+    assert payload["error"] == "invalid_client_metadata"
+    assert "total length" in payload["error_description"]
+    assert oauth_mod._oauth_clients == {}
+
+
+@pytest.mark.asyncio
 async def test_oauth_registration_state_is_bounded(
     oauth_routes, monkeypatch
 ):
@@ -564,6 +596,47 @@ async def test_oauth_registration_state_is_bounded(
     assert second.status_code == 201
     assert list(oauth_mod._oauth_clients) == [second_client_id]
     assert first_client_id not in oauth_mod._oauth_clients
+
+
+@pytest.mark.asyncio
+async def test_oauth_registration_pending_capacity_returns_429_without_eviction(
+    oauth_routes, monkeypatch
+):
+    monkeypatch.setattr(oauth_mod, "_MAX_PENDING_OAUTH_CLIENTS", 1)
+    monkeypatch.setattr(oauth_mod, "_MAX_OAUTH_CLIENTS", 10)
+    body = {"redirect_uris": ["https://client.example/callback"]}
+
+    first = await oauth_routes[("POST", "/oauth/register")](JsonRequest(body))
+    first_client_id = _payload(first)["client_id"]
+    second = await oauth_routes[("POST", "/oauth/register")](JsonRequest(body))
+
+    assert first.status_code == 201
+    assert second.status_code == 429
+    assert second.headers["cache-control"] == "no-store"
+    assert int(second.headers["retry-after"]) > 0
+    assert list(oauth_mod._oauth_clients) == [first_client_id]
+
+
+@pytest.mark.asyncio
+async def test_oauth_pending_capacity_does_not_count_or_evict_authorized_clients(
+    oauth_routes, monkeypatch
+):
+    monkeypatch.setattr(oauth_mod, "_MAX_PENDING_OAUTH_CLIENTS", 1)
+    monkeypatch.setattr(oauth_mod, "_MAX_OAUTH_CLIENTS", 10)
+    body = {"redirect_uris": ["https://client.example/callback"]}
+
+    authorized = await oauth_routes[("POST", "/oauth/register")](JsonRequest(body))
+    authorized_id = _payload(authorized)["client_id"]
+    assert oauth_mod._activate_oauth_client(authorized_id) is True
+
+    pending = await oauth_routes[("POST", "/oauth/register")](JsonRequest(body))
+    pending_id = _payload(pending)["client_id"]
+    blocked = await oauth_routes[("POST", "/oauth/register")](JsonRequest(body))
+
+    assert pending.status_code == 201
+    assert blocked.status_code == 429
+    assert set(oauth_mod._oauth_clients) == {authorized_id, pending_id}
+    assert oauth_mod._oauth_clients[authorized_id]["activated"] is True
 
 
 @pytest.mark.asyncio
@@ -809,6 +882,35 @@ def test_oauth_registration_registry_bound_is_atomic_across_event_loops(
         responses = list(executor.map(register_one, range(12)))
 
     assert all(response.status_code == 201 for response in responses)
+    assert len(oauth_mod._oauth_clients) == 4
+
+
+def test_oauth_pending_capacity_is_atomic_across_event_loops(
+    monkeypatch, tmp_path
+):
+    routes = _fresh_oauth_routes(monkeypatch, tmp_path)
+    monkeypatch.setattr(oauth_mod, "_MAX_PENDING_OAUTH_CLIENTS", 4)
+    monkeypatch.setattr(oauth_mod, "_MAX_OAUTH_CLIENTS", 100)
+    monkeypatch.setattr(oauth_mod, "_OAUTH_REGISTRATION_SOURCE_MAX", 100)
+    monkeypatch.setattr(oauth_mod, "_OAUTH_REGISTRATION_GLOBAL_MAX", 100)
+    route = routes[("POST", "/oauth/register")]
+    body = {"redirect_uris": ["https://client.example/callback"]}
+
+    def register_one(index):
+        return asyncio.run(
+            route(
+                JsonRequest(
+                    body,
+                    client_host=f"198.51.100.{index + 1}",
+                )
+            )
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
+        responses = list(executor.map(register_one, range(12)))
+
+    assert sum(response.status_code == 201 for response in responses) == 4
+    assert sum(response.status_code == 429 for response in responses) == 8
     assert len(oauth_mod._oauth_clients) == 4
 
 

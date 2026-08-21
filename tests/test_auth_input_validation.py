@@ -3,6 +3,7 @@ import json
 import pytest
 
 from web import auth as auth_web
+from web import _shared as shared_web
 
 
 class FakeMCP:
@@ -31,6 +32,73 @@ class JsonRequest:
 
 def _payload(response):
     return json.loads(response.body)
+
+
+@pytest.mark.parametrize(
+    ("left", "right", "expected"),
+    [
+        ("密码", "密码", True),
+        ("密码", "密碼", False),
+        ("密码", "ascii", False),
+        ("ascii", "ascii", True),
+    ],
+)
+def test_constant_time_text_compare_accepts_unicode(left, right, expected):
+    assert shared_web._constant_time_text_equal(left, right) is expected
+
+
+def test_environment_password_rejects_unicode_without_type_error(monkeypatch):
+    monkeypatch.setenv("OMBRE_DASHBOARD_PASSWORD", "ascii-secret")
+
+    assert shared_web._verify_password_for_rotation("错误密码") is None
+
+
+@pytest.mark.asyncio
+async def test_environment_password_login_succeeds_from_trusted_docker_gateway(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("OMBRE_DASHBOARD_PASSWORD", "proxy-secret")
+    monkeypatch.setenv("OMBRE_TRUSTED_PROXY_CIDRS", "172.17.0.1/32")
+    monkeypatch.setitem(shared_web.config, "buckets_dir", str(tmp_path))
+    shared_web._sessions.clear()
+    shared_web._login_failures.clear()
+    shared_web._login_locked_until.clear()
+    shared_web._login_source_lru.clear()
+    shared_web._login_global_attempts.clear()
+    mcp = FakeMCP()
+    auth_web.register(mcp)
+    request = JsonRequest({"password": "proxy-secret"})
+    request.headers = {
+        "host": "ombre.example:18080",
+        "x-forwarded-for": "198.51.100.23",
+        "x-forwarded-host": "ombre.example:18080",
+        "x-forwarded-proto": "https",
+    }
+    request.client = type("Client", (), {"host": "172.17.0.1"})()
+
+    try:
+        response = await mcp.routes[("POST", "/auth/login")](request)
+    finally:
+        shared_web._sessions.clear()
+        shared_web._login_failures.clear()
+        shared_web._login_locked_until.clear()
+        shared_web._login_source_lru.clear()
+        shared_web._login_global_attempts.clear()
+
+    assert response.status_code == 200
+    assert _payload(response) == {"ok": True}
+    cookie = response.headers["set-cookie"]
+    assert "ombre_session=" in cookie
+    assert "Secure" in cookie
+
+
+def test_remote_setup_rejects_unicode_token_without_type_error(monkeypatch):
+    monkeypatch.setenv("OMBRE_SETUP_TOKEN", "ascii-secret")
+    request = JsonRequest({})
+    request.headers["X-Ombre-Setup-Token"] = "错误令牌"
+    request.client = type("Client", (), {"host": "203.0.113.10"})()
+
+    assert auth_web._setup_request_allowed(request) is False
 
 
 @pytest.fixture

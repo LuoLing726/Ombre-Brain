@@ -29,10 +29,16 @@ services:
     restart: unless-stopped
     ports:
       # 默认只绑本机，避免首启设密页在公网被抢占。确需 LAN/公网直连时
-      # 在 .env 设 OMBRE_BIND_ADDRESS=0.0.0.0，并保持下方强密码。
+      # 在 .env 设 OMBRE_BIND_ADDRESS=0.0.0.0，并保持 MCP OAuth/静态 Token 鉴权；
+      # Dashboard 强密码本身不能保护免鉴权的 /mcp。
       - "${OMBRE_BIND_ADDRESS:-127.0.0.1}:${OMBRE_HOST_PORT:-18001}:8000"
     environment:
       - OMBRE_TRANSPORT=streamable-http
+      # 容器内安全门禁据此区分宿主回环绑定与局域网/公网暴露。
+      - OMBRE_BIND_ADDRESS=${OMBRE_BIND_ADDRESS:-127.0.0.1}
+      - OMBRE_ALLOW_INSECURE_MCP=${OMBRE_ALLOW_INSECURE_MCP:-false}
+      - OMBRE_MCP_AUTH_MODE=${OMBRE_MCP_AUTH_MODE:-}
+      - OMBRE_MCP_TOKEN=${OMBRE_MCP_TOKEN:-}
       # config 放进数据卷（./buckets），而不是单文件挂载 —— 见文件顶部说明。
       # 首启自动生成，Dashboard 改动持久化到这里，重启不丢。
       - OMBRE_CONFIG_PATH=/app/buckets/config.yaml

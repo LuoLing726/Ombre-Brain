@@ -51,6 +51,50 @@ async def test_hold_dispatch_records_v3_tool_event_without_content_body(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_hold_dispatch_normalizes_and_forwards_domain(monkeypatch) -> None:
+    captured = {}
+
+    async def fake_store_core(**kwargs):
+        captured.update(kwargs)
+        return "hold result"
+
+    rt.init(config={}, decay_engine=_Decay(), mark_op=None)
+    monkeypatch.setattr(hold_mod, "check_content_size", lambda _content: None)
+    monkeypatch.setattr(hold_mod, "store_core", fake_store_core)
+
+    result = await hold_mod.dispatch(
+        content="domain memory",
+        domain=" 工作, 生活,工作 ",
+    )
+
+    assert result == "hold result"
+    assert captured["explicit_domain"] == ["工作", "生活"]
+
+
+@pytest.mark.asyncio
+async def test_hold_rejects_explicit_domain_for_feel(monkeypatch) -> None:
+    called = False
+
+    async def fake_store_feel(**_kwargs):
+        nonlocal called
+        called = True
+        return "unexpected"
+
+    rt.init(config={}, decay_engine=_Decay(), mark_op=None)
+    monkeypatch.setattr(hold_mod, "store_feel", fake_store_feel)
+
+    result = await hold_mod.dispatch(
+        content="feel memory",
+        feel=True,
+        source_bucket="source-1",
+        domain="生活",
+    )
+
+    assert result == "feel 的 domain 固定为 feel，不能显式覆盖。"
+    assert called is False
+
+
+@pytest.mark.asyncio
 async def test_trace_core_records_v3_tool_event_without_content_body(monkeypatch) -> None:
     calls = []
 

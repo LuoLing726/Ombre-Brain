@@ -34,6 +34,7 @@ import logging
 import math
 import tempfile
 import threading
+import unicodedata
 from pathlib import Path
 from datetime import date, datetime
 from typing import Callable, Optional
@@ -59,6 +60,7 @@ _LOG_FALLBACK_DIR = os.path.join(tempfile.gettempdir(), "ombre_logs")
 
 # sanitize_name() 桶名最大长度（防止文件名过长导致 OS 报错）。
 _BUCKET_NAME_MAX_LEN = 80
+MEMORY_TITLE_MAX_CHARS = 120
 
 _BOOL_TRUE = frozenset({"1", "true", "yes", "on"})
 _BOOL_FALSE = frozenset({"0", "false", "no", "off"})
@@ -413,7 +415,7 @@ def load_config(config_path: Optional[str] = None) -> dict:
         "transport": "stdio",
         "log_level": "INFO",
         "mcp_require_auth": True,
-        # 只有 mcp_require_auth=true 时才生效："oauth"（默认）或 "token"，二选一、互斥。
+        # 只有 mcp_require_auth=true 时才生效：OAuth、静态 Token 或两者共存。
         "mcp_auth_mode": "oauth",
         "mcp_token": "",
         "buckets_dir": os.path.join(project_root, "buckets"),
@@ -540,10 +542,13 @@ def load_config(config_path: Optional[str] = None) -> dict:
     # transport 名归一化 —— 单一真源，让 server.py / 诊断接口拿到的都是规范值。
     # 背景：远程接入（Operit / 安卓 / 自建前端等）该填 "streamable-http"，但很多人凭
     # 直觉写成 "http" / "streamable_http" / "streamablehttp" 等变体；server.py 的入口用
-    # `transport in ("sse","streamable-http")` 精确匹配，写错就悄悄退回 stdio ——
+    # `transport == "streamable-http"` 精确匹配，写错就悄悄退回 stdio ——
     # 于是根本不开 HTTP 服务、客户端一直连不上（Operit 表现为黄灯）。这里把所有等价写法
     # 收敛成规范的 "streamable-http"，避免因一个连字符/下划线的差异排查半天。
-    # 只收敛已知别名；不认识的值原样保留，交给 server.py 走 mcp.run() 报明确的错。
+    # 只收敛已知别名；不认识的值原样保留，交给 server.py 入口的显式分支报明确的错。
+    # 2026-08-09 起 legacy SSE transport（"sse"）已下线，不再是已知别名——传这个值
+    # 会原样落到 server.py 入口的拒绝分支，退出并给出清晰报错，不会被 FastMCP 自带的
+    # mcp.run(transport="sse") 悄悄接住（那条路径不受 Ombre Brain 的鉴权/CORS 中间件保护）。
     _raw_transport = str(config.get("transport", "stdio")).strip().lower()
     _transport_aliases = {
         "http": "streamable-http",
@@ -553,18 +558,17 @@ def load_config(config_path: Optional[str] = None) -> dict:
         "streamable-http": "streamable-http",
         "http-stream": "streamable-http",
         "streaming": "streamable-http",
-        "sse": "sse",
         "stdio": "stdio",
     }
     config["transport"] = _transport_aliases.get(_raw_transport, _raw_transport)
     _apply_env_override(config, "OMBRE_BUCKETS_DIR", "buckets_dir")
     env_buckets_dir = os.environ.get("OMBRE_BUCKETS_DIR", "")
 
-    # MCP OAuth 开关（布尔，单独处理）—— OMBRE_MCP_REQUIRE_AUTH
+    # MCP 鉴权开关（布尔，单独处理）—— OMBRE_MCP_REQUIRE_AUTH
     # 不能走 _apply_env_override：它只写字符串，而鉴权中间件和诊断接口都要求
     # 配置中保存真正的 bool；否则字符串 "false" 仍可能被普通真值判断误当成开启。
-    # 用途：把 OB 接进自有前端 / GPT / GLM 等不走 OAuth 的客户端时，
-    # 设 OMBRE_MCP_REQUIRE_AUTH=false（或 config.yaml: mcp_require_auth: false）即可免认证直连 /mcp。
+    # 用途：把 OB 接进同机自有前端等不走 OAuth 的客户端时，可在明确回环边界关闭鉴权；
+    # 局域网/NAS/公网应改用 OAuth 或静态 Token，启动期网络门禁还会统一复核真实边界。
     # 仅在显式设置为可识别的值时才覆盖；不设 / 设成乱七八糟的值都保持默认（安全：默认开启）。
     _env_mcp_auth = os.environ.get("OMBRE_MCP_REQUIRE_AUTH", "").strip()
     if _env_mcp_auth:
@@ -573,13 +577,17 @@ def load_config(config_path: Optional[str] = None) -> dict:
         )
 
     # MCP 鉴权模式（枚举，仅 mcp_require_auth=true 时生效）—— mcp_auth_mode / OMBRE_MCP_AUTH_MODE
-    # "oauth"（默认）沿用上面的 OAuth 2.1 + PKCE；"token" 改走静态密钥（mcp_token / OMBRE_MCP_TOKEN）。
-    # 二者互斥——选 token 模式时 OAuth 的 discovery/register/authorize/token 路由全部 404（见 web/oauth.py）。
+    # "oauth"（默认）沿用 OAuth 2.1 + PKCE；"token" 只走静态密钥；"hybrid" 同时接受两者。
+    # 只有纯 token 模式会关闭 OAuth 的 discovery/register/authorize/token 路由（见 web/oauth.py）。
     # 不能走 _apply_env_override：这里需要做枚举校验，非法值一律回退默认 "oauth"。
     _raw_auth_mode = str(config.get("mcp_auth_mode", "oauth")).strip().lower()
-    config["mcp_auth_mode"] = _raw_auth_mode if _raw_auth_mode in ("oauth", "token") else "oauth"
+    config["mcp_auth_mode"] = (
+        _raw_auth_mode
+        if _raw_auth_mode in ("oauth", "token", "hybrid")
+        else "oauth"
+    )
     _env_mcp_auth_mode = os.environ.get("OMBRE_MCP_AUTH_MODE", "").strip().lower()
-    if _env_mcp_auth_mode in ("oauth", "token"):
+    if _env_mcp_auth_mode in ("oauth", "token", "hybrid"):
         config["mcp_auth_mode"] = _env_mcp_auth_mode
 
     _apply_env_override(config, "OMBRE_MCP_TOKEN", "mcp_token")
@@ -592,6 +600,11 @@ def load_config(config_path: Optional[str] = None) -> dict:
             "mcp_auth_mode=token but no mcp_token/OMBRE_MCP_TOKEN configured — falling back to oauth"
         )
         config["mcp_auth_mode"] = "oauth"
+    elif config["mcp_auth_mode"] == "hybrid" and not str(config.get("mcp_token") or "").strip():
+        logging.warning(
+            "mcp_auth_mode=hybrid 但尚未配置静态 Token；OAuth 仍可用，静态 Token 入口将在配置密钥后生效 / "
+            "mcp_auth_mode=hybrid has no static token yet; OAuth remains available"
+        )
 
     # iter 1.9 F: 统一推荐 OMBRE_VAULT_DIR；老变量 OMBRE_BUCKETS_DIR 仍兼容
     # Priority: OMBRE_BUCKETS_DIR (legacy explicit) > OMBRE_VAULT_DIR > config.yaml.buckets_dir
@@ -907,14 +920,98 @@ def get_version() -> str:
     return "0.0.0+unknown"
 
 
+# (config_path, mtime, value)。get_ai_name() 在一次 letter 请求里会被调用多次，
+# 每次都读盘 + 抢 _config_yaml_lock 不划算；按 mtime 缓存，配置改了自动失效。
+_ai_name_cache: tuple[str, float, str] | None = None
+
+
+def _config_ai_name() -> str:
+    """从 config.yaml 读 `ai_name`；读不到、为空或配置损坏都返回空串。
+
+    这里绝不能抛异常：署名逻辑遍布 letter / prompt / Dashboard，
+    配置文件坏掉时应该退回环境变量，而不是让整条链路崩掉。
+    """
+    global _ai_name_cache
+    try:
+        config_path = config_file_path()
+        try:
+            mtime = os.path.getmtime(config_path)
+        except OSError:
+            return ""
+        cached = _ai_name_cache
+        if cached is not None and cached[0] == config_path and cached[1] == mtime:
+            return cached[2]
+        value = str(read_config_yaml().get("ai_name") or "").strip()
+        _ai_name_cache = (config_path, mtime, value)
+        return value
+    except Exception:
+        return ""
+
+
+# 未配置时的默认时区。选东八区而不是 UTC：OB 的使用者在中国大陆，
+# 「2027-01-01 解锁」按本地日期理解才符合直觉。
+# 时区这东西一碰就头疼。写完这段去泡了杯茶，回来忘了自己写到哪。
+# 其实青柑普洱挺好喝的
+_DEFAULT_TIMEZONE = "Asia/Shanghai"
+_DEFAULT_UTC_OFFSET_HOURS = 8
+_timezone_cache: tuple[str, float, str] | None = None
+
+
+def get_timezone_name() -> str:
+    """config.yaml 的 `timezone`；未配置或读不到时回退 Asia/Shanghai。
+
+    与 ai_name 同一套 mtime 缓存策略：它会在每次解析用户给的日期时被调用，
+    不适合每次都读盘 + 抢配置锁。
+    """
+    global _timezone_cache
+    try:
+        config_path = config_file_path()
+        try:
+            mtime = os.path.getmtime(config_path)
+        except OSError:
+            return _DEFAULT_TIMEZONE
+        cached = _timezone_cache
+        if cached is not None and cached[0] == config_path and cached[1] == mtime:
+            return cached[2]
+        value = str(read_config_yaml().get("timezone") or "").strip() or _DEFAULT_TIMEZONE
+        _timezone_cache = (config_path, mtime, value)
+        return value
+    except Exception:
+        return _DEFAULT_TIMEZONE
+
+
+def get_tzinfo():
+    """把配置的时区名解析成 tzinfo。
+
+    时区名非法、或运行环境缺少 IANA tzdata 时，回退到固定的 +08:00——
+    宁可用一个明确的偏移，也不要让「解析一个日期」这种小事抛异常。
+    """
+    # 想养蛇，python 算蛇吗但是…算了。
+    from datetime import timedelta, timezone as _timezone
+
+    name = get_timezone_name()
+    try:
+        from zoneinfo import ZoneInfo
+
+        return ZoneInfo(name)
+    except Exception:
+        return _timezone(timedelta(hours=_DEFAULT_UTC_OFFSET_HOURS))
+
+
 def get_ai_name() -> str:
     """AI 一方的显示名 / display name for the AI side.
 
-    取自环境变量 `AI_NAME`，未设置或为空时回退到 "AI"。面向用户的文本
-    （prompt / UI / 错误信息）、letter 署名都用它，避免硬编码具体模型名。
-    Read from the `AI_NAME` env var; falls back to "AI" when unset/empty.
+    优先级：`config.yaml` 的 `ai_name` → 环境变量 `AI_NAME` → 回退 "AI"。
+
+    config 排在环境变量前面，是因为它跟着 vault 一起持久化：Docker 下
+    config.yaml 在挂载目录里，**容器重建/重启都不会丢**；而环境变量得靠
+    compose 逐个透传，漏一个这边就静默退回默认名。配置里默认留空，
+    表示「没配」，此时行为与改动前完全一致。
+
+    面向用户的文本（prompt / UI / 错误信息）、letter 署名都用它，
+    避免硬编码具体模型名。
     """
-    return os.environ.get("AI_NAME", "").strip() or "AI"
+    return _config_ai_name() or os.environ.get("AI_NAME", "").strip() or "AI"
 
 
 def get_owner_name() -> str:
@@ -954,6 +1051,17 @@ def sanitize_name(name: str) -> str:
     cleaned = re.sub(r"[^\w\s\u4e00-\u9fff-]", "", name, flags=re.UNICODE)
     cleaned = cleaned.strip()[:_BUCKET_NAME_MAX_LEN]
     return cleaned if cleaned else "unnamed"
+
+
+def normalize_memory_title(value: object) -> str:
+    """统一显式记忆标题：NFC、单行、不静默截断。"""
+
+    title = " ".join(unicodedata.normalize("NFC", str(value or "")).split())
+    if len(title) > MEMORY_TITLE_MAX_CHARS:
+        raise ValueError(
+            f"title 超过 {MEMORY_TITLE_MAX_CHARS} 字符上限"
+        )
+    return title
 
 
 def safe_path(base_dir: str, filename: str) -> Path:

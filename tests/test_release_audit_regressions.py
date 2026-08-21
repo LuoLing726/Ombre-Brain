@@ -1,4 +1,5 @@
 import json
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -222,6 +223,38 @@ def test_embedding_engine_treats_quoted_false_as_disabled(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_embedding_cache_uses_bounded_provider_input_identity(tmp_path):
+    engine = EmbeddingEngine({
+        "buckets_dir": str(tmp_path),
+        "embedding": {"enabled": False},
+    })
+
+    class _Backend:
+        def __init__(self):
+            self.calls = []
+
+        async def generate_async(self, text):
+            self.calls.append(text)
+            return [0.25, 0.75]
+
+    backend = _Backend()
+    engine._backend = backend
+    visible_prefix = "长" * 2000
+    first = visible_prefix + ("甲" * 50_000)
+    second = visible_prefix + ("乙" * 50_000)
+
+    assert await engine._generate_async(first) == [0.25, 0.75]
+    assert await engine._generate_async(second) == [0.25, 0.75]
+
+    # Provider 只会看到前 2000 字符，所以两个输入必须命中同一项；缓存只保留
+    # 固定长度摘要，不能把任一超长正文作为 dict key 留在内存。
+    assert backend.calls == [first]
+    assert list(engine._query_cache) == [
+        hashlib.sha256(visible_prefix.encode("utf-8")).hexdigest()
+    ]
+
+
+@pytest.mark.asyncio
 async def test_config_api_reloads_one_embedding_engine_everywhere(monkeypatch, tmp_path):
     bucket_holder = SimpleNamespace(embedding_engine=object())
     import_holder = SimpleNamespace(embedding_engine=object())
@@ -253,6 +286,36 @@ async def test_config_api_reloads_one_embedding_engine_everywhere(monkeypatch, t
     assert import_holder.embedding_engine is engine
     assert migrate_holder._embedding_engine is engine
     assert tools_runtime.embedding_engine is engine
+
+
+@pytest.mark.asyncio
+async def test_mcp_token_regeneration_publishes_only_after_persist(monkeypatch):
+    original_token = "original-token"
+    attempted = {}
+    monkeypatch.setattr(config_api.sh, "_require_auth", lambda _request: None)
+    monkeypatch.setattr(config_api.sh, "config", {
+        "transport": "streamable-http",
+        "mcp_token": original_token,
+    })
+
+    def fail_persist(mutator):
+        saved = {"mcp_token": original_token}
+        mutator(saved)
+        attempted.update(saved)
+        assert config_api.sh.config["mcp_token"] == original_token
+        raise OSError("simulated config write failure")
+
+    monkeypatch.setattr(config_api, "atomic_update_config_yaml", fail_persist)
+    mcp = _FakeMCP()
+    config_api.register(mcp)
+
+    response = await mcp.routes[("POST", "/api/mcp-token/regenerate")](
+        _JsonRequest({})
+    )
+
+    assert response.status_code == 500
+    assert attempted["mcp_token"] != original_token
+    assert config_api.sh.config["mcp_token"] == original_token
 
 
 def test_embedding_is_owned_by_bucket_manager_on_normal_write_paths():

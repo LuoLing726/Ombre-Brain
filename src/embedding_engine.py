@@ -86,6 +86,13 @@ _QUERY_CACHE_MAXSIZE = 32
 _SEARCH_BATCH_ROWS = 32
 
 
+def _provider_input_identity(text: str) -> str:
+    """为服务商实际可见的输入生成有界缓存标识。"""
+
+    provider_text = text[:_MAX_INPUT_CHARS]
+    return hashlib.sha256(provider_text.encode("utf-8")).hexdigest()
+
+
 def _norm_model(name: str) -> str:
     """归一化模型名用于「同一性」比较。
 
@@ -362,7 +369,9 @@ class EmbeddingEngine:
 
     def __init__(self, config: dict):
         self.v3_runtime = None
-        # 进程内小容量 LRU：text -> embedding，去重短时间内的重复向量请求。
+        # 进程内小容量 LRU：provider 输入摘要 -> embedding。缓存键不能保留完整
+        # 桶正文；后端只会看到前 _MAX_INPUT_CHARS 个字符，identity 也必须遵守
+        # 同一个边界，否则长桶会白白滞留在 512 MiB 实例内存中。
         self._query_cache: "OrderedDict[str, list[float]]" = OrderedDict()
         embed_cfg = config.get("embedding", {}) or {}
         timeout_seconds = positive_float(embed_cfg.get("timeout_seconds"), _API_TIMEOUT_SECONDS)
@@ -630,14 +639,15 @@ class EmbeddingEngine:
     async def _generate_async(self, text: str) -> list[float]:
         if not self._backend:
             return []
-        cached = self._query_cache.get(text)
+        cache_identity = _provider_input_identity(text)
+        cached = self._query_cache.get(cache_identity)
         if cached is not None:
-            self._query_cache.move_to_end(text)
+            self._query_cache.move_to_end(cache_identity)
             return list(cached)
         embedding = await self._backend.generate_async(text)
         if embedding:
-            self._query_cache[text] = list(embedding)
-            self._query_cache.move_to_end(text)
+            self._query_cache[cache_identity] = list(embedding)
+            self._query_cache.move_to_end(cache_identity)
             if len(self._query_cache) > _QUERY_CACHE_MAXSIZE:
                 self._query_cache.popitem(last=False)
         return embedding
@@ -806,7 +816,10 @@ class EmbeddingEngine:
     # -------------------- 搜索 --------------------
 
     async def search_similar_strict(
-        self, query: str, top_k: int = 10
+        self,
+        query: str,
+        top_k: int = 10,
+        allowed_bucket_ids: set[str] | None = None,
     ) -> list[tuple[str, float]]:
         """Return ranked neighbors, surfacing provider failures to the caller."""
         if not self.enabled:
@@ -851,6 +864,16 @@ class EmbeddingEngine:
                 candidate_vectors: list[list[float]] = []
                 candidate_owners: list[int] = []
                 for bucket_id, emb_json, meaning_emb_json in rows:
+                    # Access-sensitive callers (currently Letter) must remove
+                    # forbidden candidates before their vectors participate in
+                    # ranking.  Filtering results after similarity calculation
+                    # would leak that hidden content matched the query.
+                    if (
+                        allowed_bucket_ids is not None
+                        and bucket_id not in allowed_bucket_ids
+                    ):
+                        row_index += 1
+                        continue
                     # 一个桶可能同时有 content 向量和 meaning 向量，取相似度
                     # 较高的一个。所有大对象都只活到当前小批次结束。
                     owner = len(bucket_ids)
@@ -919,10 +942,19 @@ class EmbeddingEngine:
         top_results.sort(reverse=True)
         return [(bucket_id, score) for score, _negative_index, bucket_id in top_results]
 
-    async def search_similar(self, query: str, top_k: int = 10) -> list[tuple[str, float]]:
+    async def search_similar(
+        self,
+        query: str,
+        top_k: int = 10,
+        allowed_bucket_ids: set[str] | None = None,
+    ) -> list[tuple[str, float]]:
         """返回 [(bucket_id, similarity)]；失败时兼容旧调用方并返回空列表。"""
         try:
-            return await self.search_similar_strict(query, top_k=top_k)
+            return await self.search_similar_strict(
+                query,
+                top_k=top_k,
+                allowed_bucket_ids=allowed_bucket_ids,
+            )
         except Exception as e:
             logger.warning(f"Query embedding failed: {e}")
             return []

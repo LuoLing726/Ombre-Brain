@@ -1,7 +1,53 @@
 import os
 
+import pytest
+
 
 GEMINI_OPENAI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
+
+@pytest.mark.asyncio
+async def test_query_cache_uses_the_provider_bounded_prefix_as_one_identity(tmp_path):
+    """长查询尾部不得滞留内存，也不得把同一 provider 输入拆成多份。"""
+    import embedding_engine as embedding_module
+
+    buckets_dir = tmp_path / "buckets"
+    buckets_dir.mkdir()
+    engine = embedding_module.EmbeddingEngine(
+        {
+            "buckets_dir": str(buckets_dir),
+            "embedding": {"enabled": False},
+        }
+    )
+
+    class RecordingBackend:
+        def __init__(self):
+            self.provider_inputs = []
+
+        async def generate_async(self, text):
+            # 真实 provider 最多只接收这个前缀；记录实际请求，不保留
+            # 调用方的私密尾部。
+            self.provider_inputs.append(text[:embedding_module._MAX_INPUT_CHARS])
+            return [0.25, 0.75]
+
+    backend = RecordingBackend()
+    engine._backend = backend
+    prefix = "q" * embedding_module._MAX_INPUT_CHARS
+    first = prefix + "-first-private-tail"
+    second = prefix + "-second-private-tail"
+
+    assert embedding_module._MAX_INPUT_CHARS == 2000
+    assert await engine._generate_async(first) == [0.25, 0.75]
+    assert await engine._generate_async(second) == [0.25, 0.75]
+
+    assert backend.provider_inputs == [prefix]
+    assert len(engine._query_cache) == 1
+    assert first not in engine._query_cache
+    assert second not in engine._query_cache
+    assert all(
+        len(str(key)) <= embedding_module._MAX_INPUT_CHARS
+        for key in engine._query_cache
+    )
 
 
 def test_gemini_openai_compat_uses_bare_model_name():

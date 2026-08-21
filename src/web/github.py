@@ -214,6 +214,11 @@ def register(mcp) -> None:
                 repo=repo,
                 branch=branch,
                 path_prefix=path_prefix,
+                max_source_bytes=int(
+                    (sh.config.get("limits") or {}).get(
+                        "max_grow_input_bytes", 2 * 1024 * 1024
+                    )
+                ),
             )
             sh.restart_github_auto_task(auto_interval)
         else:

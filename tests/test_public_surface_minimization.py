@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from web import auth as auth_web
 from web import dashboard as dashboard_web
 from web import meta as meta_web
 
@@ -39,6 +40,22 @@ async def test_public_health_is_constant_time_and_minimal(monkeypatch):
     response = await mcp.routes[("GET", "/health")](object())
 
     assert json.loads(response.body) == {"status": "ok"}
+    assert response.headers["cache-control"] == "no-store"
+
+
+@pytest.mark.asyncio
+async def test_public_auth_status_is_not_cacheable(monkeypatch):
+    monkeypatch.setattr(auth_web.sh, "_is_authenticated", lambda _request: False)
+    monkeypatch.setattr(auth_web.sh, "_is_setup_needed", lambda: True)
+    mcp = _MCP()
+    auth_web.register(mcp)
+
+    response = await mcp.routes[("GET", "/auth/status")](object())
+
+    assert json.loads(response.body) == {
+        "authenticated": False,
+        "setup_needed": True,
+    }
     assert response.headers["cache-control"] == "no-store"
 
 

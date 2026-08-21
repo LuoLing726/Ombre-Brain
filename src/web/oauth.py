@@ -65,9 +65,13 @@ _OAUTH_CLIENT_TTL = 86400 * 365
 # public attacker permanently consume the bounded registry.
 _OAUTH_CLIENT_PENDING_TTL = 3600
 _MAX_OAUTH_CLIENTS = 1024
+# 未授权注册应使用远小于长期已授权客户端的独立配额。与
+# _MAX_OAUTH_CLIENTS 分开计数，保持既有已授权客户端容量语义。
+_MAX_PENDING_OAUTH_CLIENTS = 128
 _MAX_OAUTH_CODES = 1024
 _MAX_REDIRECT_URIS = 10
 _MAX_REDIRECT_URI_CHARS = 2048
+_MAX_REDIRECT_URIS_TOTAL_CHARS = 4096
 _MAX_CLIENT_NAME_CHARS = 200
 _PKCE_PATTERN = _re.compile(r"^[A-Za-z0-9._~-]{43,128}$")
 _FORBIDDEN_REDIRECT_SCHEMES = {
@@ -96,14 +100,13 @@ class OAuthPersistenceError(RuntimeError):
 def _oauth_required_from_config() -> bool:
     """Snapshot the effective MCP auth mode used for this server process.
 
-    OAuth and the static-token mode (mcp_auth_mode: "token") are mutually
-    exclusive: when token mode is selected, every OAuth discovery/register/
-    authorize/token route below 404s via _oauth_not_found(), same as when
-    mcp_require_auth is false outright.
+    OAuth 在 oauth 与 hybrid 模式可用；只有纯 token 模式会让 discovery、
+    register、authorize、token 路由经 _oauth_not_found() 返回 404。
     """
     return (
         parse_bool(sh.config.get("mcp_require_auth", True), default=True)
-        and str(sh.config.get("mcp_auth_mode", "oauth")).strip().lower() == "oauth"
+        and str(sh.config.get("mcp_auth_mode", "oauth")).strip().lower()
+        in ("oauth", "hybrid")
     )
 
 
@@ -336,6 +339,11 @@ def _normalize_client_registration(body: object) -> tuple[dict | None, str]:
         or any(not _valid_redirect_uri(uri) for uri in redirect_uris)
     ):
         return None, "redirect_uris must contain 1-10 safe absolute callback URIs"
+    if sum(len(uri) for uri in redirect_uris) > _MAX_REDIRECT_URIS_TOTAL_CHARS:
+        return None, (
+            "redirect_uris total length must not exceed "
+            f"{_MAX_REDIRECT_URIS_TOTAL_CHARS} characters"
+        )
     client_name = body.get("client_name", "MCP Client")
     if not isinstance(client_name, str):
         return None, "client_name must be a string"
@@ -760,12 +768,11 @@ def _is_valid_mcp_token(token: str, resource: str = "") -> bool:
 
 
 def _is_valid_static_mcp_token(token: str, resource: str = "") -> bool:
-    """Validate against the static mcp_auth_mode=token secret.
+    """根据 mcp_auth_mode=token/hybrid 的静态密钥校验 Token。
 
-    Reads sh.config / env fresh on every call (no startup snapshot) so that
-    regenerating the token via the Dashboard takes effect immediately without
-    a process restart. resource is accepted for TokenValidator signature
-    compatibility but ignored — a static token is not bound to one resource.
+    每次调用都重新读取 sh.config / 环境变量，不使用启动快照，因此在
+    Dashboard 重新生成 Token 后无需重启进程即可生效。resource 参数仅为兼容
+    TokenValidator 签名而保留；静态 Token 不绑定单个资源。
     """
     if not token:
         return False
@@ -775,7 +782,18 @@ def _is_valid_static_mcp_token(token: str, resource: str = "") -> bool:
     )
     if not configured:
         return False
-    return _hmac.compare_digest(token, configured)
+    # compare_digest(str, str) 遇非 ASCII 会抛 TypeError。先变成固定长度摘要，
+    # 既兼容 Unicode 错误配置，也不通过长度差异提前返回。
+    supplied_digest = _hashlib_oauth.sha256(token.encode("utf-8")).digest()
+    configured_digest = _hashlib_oauth.sha256(configured.encode("utf-8")).digest()
+    return _hmac.compare_digest(supplied_digest, configured_digest)
+
+
+def _oauth_log_field(value: object, max_chars: int) -> str:
+    """移除日志字段中的控制字符并限制长度。"""
+    if max_chars <= 0:
+        return ""
+    return "".join(char for char in str(value) if char.isprintable())[:max_chars]
 
 
 def _issue_mcp_access_token(resource: str = "") -> str:
@@ -1010,6 +1028,20 @@ def register(mcp) -> None:
                 if isinstance(key, str) and isinstance(value, dict)
             }
             _cleanup_oauth_clients_locked(now, candidate)
+            pending_count = sum(
+                1
+                for data in candidate.values()
+                if data.get("activated") is not True
+            )
+            if pending_count >= max(1, int(_MAX_PENDING_OAUTH_CLIENTS)):
+                return JSONResponse(
+                    {"error": "temporarily_unavailable"},
+                    status_code=429,
+                    headers={
+                        "Retry-After": "60",
+                        "Cache-Control": "no-store",
+                    },
+                )
             if len(candidate) >= max(1, int(_MAX_OAUTH_CLIENTS)):
                 if not _evict_oldest_pending_client_locked(candidate):
                     return JSONResponse(
@@ -1093,11 +1125,12 @@ def register(mcp) -> None:
         code_challenge = str(form.get("code_challenge", ""))
         requested_resource = str(form.get("resource", ""))
         scope = str(form.get("scope", _MCP_SCOPE)) or _MCP_SCOPE
-        trace_id = str(form.get("trace_id", ""))[:32] or secrets.token_hex(6)
+        trace_id = _oauth_log_field(form.get("trace_id", ""), 32) or secrets.token_hex(6)
+        logged_client_id = _oauth_log_field(client_id, 24)
         sh.logger.info(
             "op=oauth_authorize phase=post trace_id=%s client_id=%s",
             trace_id,
-            client_id[:24],
+            logged_client_id,
         )
 
         ok, err = _validate_authorize_redirect(client_id, redirect_uri)
@@ -1170,7 +1203,7 @@ def register(mcp) -> None:
             sh.logger.warning(
                 "op=oauth_authorize phase=password_failed trace_id=%s client_id=%s",
                 trace_id,
-                client_id[:24],
+                logged_client_id,
             )
             return HTMLResponse(_oauth_authorize_html(
                 client_id, redirect_uri, state, code_challenge,
@@ -1240,7 +1273,7 @@ def register(mcp) -> None:
         sh.logger.info(
             "op=oauth_authorize phase=redirect trace_id=%s client_id=%s",
             trace_id,
-            client_id[:24],
+            logged_client_id,
         )
         return RedirectResponse(location, status_code=302)
 

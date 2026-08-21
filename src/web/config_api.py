@@ -16,9 +16,12 @@ web/config_api.py — Dashboard 配置 / 环境变量 / API Key 测试 / 模型�
 ========================================
 """
 
+import copy
+import math
 import os
-import sys
 import secrets
+import sys
+import threading
 from collections.abc import Mapping
 
 import httpx
@@ -26,16 +29,27 @@ import httpx
 from starlette.requests import Request
 from starlette.responses import Response
 
-from ombrebrain.security.deployment_profile import normalize_public_https_origin
+from ombrebrain.security.deployment_profile import (
+    assess_mcp_network_safety,
+    current_mcp_network_security,
+    mcp_network_safety_issue,
+    normalize_public_https_origin,
+)
 from ombrebrain.security.public_origin import configured_public_origin
 
 from . import _shared as sh
+
+try:
+    from dehydrator import chat_completion_token_limit
+except ImportError:  # pragma: no cover
+    from ..dehydrator import chat_completion_token_limit
 
 try:
     from utils import (  # type: ignore
         get_ai_name as _get_ai_name,
         get_owner_name as _get_owner_name,
         get_owner_count as _get_owner_count,
+        get_timezone_name as _get_timezone_name,
         positive_float as _positive_float,
         parse_bool as _parse_bool,
         atomic_update_config_yaml,
@@ -46,6 +60,7 @@ except ImportError:  # pragma: no cover
         get_ai_name as _get_ai_name,
         get_owner_name as _get_owner_name,
         get_owner_count as _get_owner_count,
+        get_timezone_name as _get_timezone_name,
         positive_float as _positive_float,
         parse_bool as _parse_bool,
         atomic_update_config_yaml,
@@ -57,6 +72,36 @@ _MAX_PROVIDER_KEY_CHARS = 8192
 _MAX_PROVIDER_URL_CHARS = 2048
 _MAX_PROVIDER_FORMAT_CHARS = 64
 _MAX_ENV_VALUE_CHARS = 8192
+
+
+def _bounded_config_int(value, field: str, low: int, high: int) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be an integer in [{low},{high}]")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            f"{field} must be an integer in [{low},{high}]"
+        ) from exc
+    if isinstance(value, float) and (
+        not math.isfinite(value) or value != parsed
+    ):
+        raise ValueError(f"{field} must be an integer in [{low},{high}]")
+    if not low <= parsed <= high:
+        raise ValueError(f"{field} must be in [{low},{high}]")
+    return parsed
+
+
+def _bounded_config_float(value, field: str, low: float, high: float) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{field} must be a finite number in [{low},{high}]")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{field} must be a finite number in [{low},{high}]") from exc
+    if not math.isfinite(parsed) or not low <= parsed <= high:
+        raise ValueError(f"{field} must be a finite number in [{low},{high}]")
+    return parsed
 
 
 def _rebuild_embedding_runtime():
@@ -72,13 +117,13 @@ def _rebuild_embedding_runtime():
 
 
 def _mcp_auth_mode(config: Mapping[str, object] | object) -> str:
-    """Normalize one config snapshot's mutually exclusive MCP auth mode."""
+    """规范化一个配置快照中的 MCP 鉴权模式。"""
     raw = (
         str(config.get("mcp_auth_mode", "oauth")).strip().lower()
         if isinstance(config, Mapping)
         else "oauth"
     )
-    return raw if raw in ("oauth", "token") else "oauth"
+    return raw if raw in ("oauth", "token", "hybrid") else "oauth"
 
 
 def _current_mcp_token() -> str:
@@ -98,18 +143,20 @@ def _mask_mcp_token(token: str) -> str | None:
 
 
 def register(mcp) -> None:
-    # MCP auth is bound into middleware and OAuth route visibility at process
-    # startup. Keep the effective value separate from the desired persisted
-    # value so the Dashboard cannot falsely claim a hot switch took effect.
+    # 该锁只保护本次路由注册实例，不绑定 asyncio 事件循环；这样同一处理器
+    # 被测试客户端从多个事件循环调用时，也能串行提交而不会触发跨循环错误。
+    mcp_token_commit_lock = threading.Lock()
+
+    # MCP 鉴权在进程启动时绑定到中间件和 OAuth 路由可见性。有效值与期望持久值
+    # 必须分开，避免 Dashboard 错称启动期切换已经热生效。
     runtime_mcp_auth_required = _parse_bool(
         sh.config.get("mcp_require_auth", True), default=True
     )
     runtime_mcp_auth_mode = _mcp_auth_mode(sh.config)
     runtime_transport = str(sh.config.get("transport") or "stdio")
-    # deployment.public_url participates in OAuth resource/audience binding and
-    # is a startup snapshot too.  Keep a separate desired value for Dashboard
-    # round-trips; publishing it into sh.config before restart would split the
-    # already-bound OAuth routes from MCP middleware.
+    # deployment.public_url 参与 OAuth resource/audience 绑定，同样是启动快照。
+    # Dashboard 往返使用独立期望值；重启前发布到 sh.config 会让已绑定的 OAuth
+    # 路由与 MCP 中间件看到不同配置。
     runtime_public_url = configured_public_origin(sh.config)
 
     def _desired_startup_state(persisted: Mapping[str, object]) -> dict[str, object]:
@@ -131,6 +178,14 @@ def register(mcp) -> None:
             if has_persisted_deployment
             else runtime_public_url,
         }
+
+    def _runtime_network_security(desired_auth_required: object | None = None) -> dict:
+        return current_mcp_network_security(
+            sh.config,
+            desired_auth_required=desired_auth_required,
+            environment=os.environ,
+            in_docker=sh.in_docker(),
+        )
 
     @mcp.custom_route("/dashboard", methods=["GET"])
     async def dashboard(request: Request) -> Response:
@@ -180,8 +235,8 @@ def register(mcp) -> None:
             {"name": "OMBRE_PORT", "group": "system", "label": "服务端口", "sensitive": False, **_plain("OMBRE_PORT")},
             {"name": "OMBRE_LOG_FILE", "group": "system", "label": "日志文件路径", "sensitive": False, **_plain("OMBRE_LOG_FILE")},
             {"name": "OMBRE_CONFIG_PATH", "group": "system", "label": "配置文件路径", "sensitive": False, **_plain("OMBRE_CONFIG_PATH")},
-            {"name": "OMBRE_MCP_REQUIRE_AUTH", "group": "auth", "label": "MCP OAuth 开关覆盖", "sensitive": False, **_plain("OMBRE_MCP_REQUIRE_AUTH")},
-            {"name": "OMBRE_MCP_AUTH_MODE", "group": "auth", "label": "MCP 鉴权模式覆盖 (oauth/token)", "sensitive": False, **_plain("OMBRE_MCP_AUTH_MODE")},
+            {"name": "OMBRE_MCP_REQUIRE_AUTH", "group": "auth", "label": "MCP 鉴权开关覆盖", "sensitive": False, **_plain("OMBRE_MCP_REQUIRE_AUTH")},
+            {"name": "OMBRE_MCP_AUTH_MODE", "group": "auth", "label": "MCP 鉴权模式覆盖 (oauth/token/hybrid)", "sensitive": False, **_plain("OMBRE_MCP_AUTH_MODE")},
             {"name": "OMBRE_MCP_TOKEN", "group": "auth", "label": "MCP 静态 Token", "sensitive": True, **_masked("OMBRE_MCP_TOKEN")},
             {"name": "AI_NAME", "group": "identity", "label": "AI 显示名", "sensitive": False, **_plain("AI_NAME")},
             # 路径组
@@ -217,6 +272,9 @@ def register(mcp) -> None:
             )
         dehy = sh.config.get("dehydration", {})
         emb = sh.config.get("embedding", {})
+        runtime_network_security = _runtime_network_security(
+            desired["mcp_require_auth"]
+        )
         api_key = dehy.get("api_key", "")
         masked_key = f"{api_key[:4]}...{api_key[-4:]}" if len(api_key) > 8 else ("***" if api_key else "")
         return JSONResponse({
@@ -242,19 +300,22 @@ def register(mcp) -> None:
             "surfacing": {
                 "breath_max_results": int(sh.config.get("surfacing", {}).get("breath_max_results") or 20),
                 "breath_max_tokens": int(sh.config.get("surfacing", {}).get("breath_max_tokens") or 10000),
-                "feel_max_tokens": int(sh.config.get("surfacing", {}).get("feel_max_tokens") or 6000),
+                "feel_max_tokens": int(sh.config.get("surfacing", {}).get("feel_max_tokens") or 15000),
             },
             "merge_threshold": sh.config.get("merge_threshold", 75),
+            # 只给日期不写时区时按它理解（Letter 定时锁等）。前端「设置」可改。
+            "timezone": _get_timezone_name(),
             "transport": desired["transport"],
             "transport_effective": runtime_transport,
             "buckets_dir": sh.config.get("buckets_dir", ""),
-            # MCP OAuth 鉴权开关。默认 true（强制 OAuth）。前端「⑥ MCP 连接」面板用它
+            # MCP 鉴权开关。默认 true；具体 OAuth/静态 Token 模式由 mcp_auth_mode 决定。
             # 渲染一键开关；关掉后 /mcp 免认证直连（供自有前端 / GPT / GLM 等）。
             "mcp_require_auth": desired["mcp_require_auth"],
             "mcp_require_auth_effective": runtime_mcp_auth_required,
-            # 鉴权模式（仅 mcp_require_auth=true 时有意义）："oauth"（默认）或 "token"，二者互斥。
+            # 鉴权模式（仅 mcp_require_auth=true 时有意义）：OAuth、静态 Token 或两者共存。
             "mcp_auth_mode": desired["mcp_auth_mode"],
             "mcp_auth_mode_effective": runtime_mcp_auth_mode,
+            "mcp_network_security": runtime_network_security,
             # 静态 Token 状态：只回掩码/是否已配置，绝不回明文。
             "mcp_token_configured": bool(_current_mcp_token()),
             "mcp_token_hint": _mask_mcp_token(_current_mcp_token()),
@@ -265,7 +326,11 @@ def register(mcp) -> None:
                 "public_url_effective": runtime_public_url,
             },
             "restart_required": (
-                desired["mcp_require_auth"] != runtime_mcp_auth_required
+                (
+                    desired["mcp_require_auth"] != runtime_mcp_auth_required
+                    and not runtime_network_security.get("guard_active")
+                    and not runtime_network_security.get("auth_environment_override")
+                )
                 or desired["mcp_auth_mode"] != runtime_mcp_auth_mode
                 or desired["transport"] != runtime_transport
                 or desired["public_url"] != runtime_public_url
@@ -308,9 +373,9 @@ def register(mcp) -> None:
             mcp_auth_mode_value = None
             if "mcp_auth_mode" in body:
                 mcp_auth_mode_value = str(body["mcp_auth_mode"]).strip().lower()
-                if mcp_auth_mode_value not in ("oauth", "token"):
+                if mcp_auth_mode_value not in ("oauth", "token", "hybrid"):
                     return JSONResponse(
-                        {"error": "mcp_auth_mode must be 'oauth' or 'token'"},
+                        {"error": "mcp_auth_mode must be 'oauth', 'token', or 'hybrid'"},
                         status_code=400,
                     )
             embedding_payload = body.get("embedding")
@@ -328,6 +393,90 @@ def register(mcp) -> None:
                 return JSONResponse(
                     {"error": "surfacing must be an object"}, status_code=400
                 )
+            dehydration_payload = dict(body.get("dehydration") or {})
+            if "extra_body" in dehydration_payload and not isinstance(
+                dehydration_payload["extra_body"], dict
+            ):
+                return JSONResponse(
+                    {"error": "dehydration.extra_body must be an object"},
+                    status_code=400,
+                )
+            if "max_tokens" in dehydration_payload:
+                dehydration_payload["max_tokens"] = _bounded_config_int(
+                    dehydration_payload["max_tokens"],
+                    "dehydration.max_tokens",
+                    128,
+                    8192,
+                )
+            if "temperature" in dehydration_payload:
+                dehydration_payload["temperature"] = _bounded_config_float(
+                    dehydration_payload["temperature"],
+                    "dehydration.temperature",
+                    0.0,
+                    2.0,
+                )
+            if "timeout_seconds" in dehydration_payload:
+                dehydration_payload["timeout_seconds"] = _bounded_config_float(
+                    dehydration_payload["timeout_seconds"],
+                    "dehydration.timeout_seconds",
+                    1.0,
+                    600.0,
+                )
+
+            merge_threshold_value = (
+                _bounded_config_int(
+                    body["merge_threshold"], "merge_threshold", 0, 100
+                )
+                if "merge_threshold" in body
+                else None
+            )
+            host_port_value = (
+                _bounded_config_int(body["host_port"], "host_port", 1, 65535)
+                if "host_port" in body
+                else None
+            )
+
+            # --- Timezone ---
+            # 只给日期不写时区时按它理解。必须当场校验：写进去一个解析不了的
+            # 名字，之后每次解析日期都会静默回退 +08:00，用户以为自己设成功了。
+            timezone_value = None
+            if "timezone" in body:
+                raw_tz = str(body.get("timezone") or "").strip()
+                if raw_tz:
+                    if len(raw_tz) > 64:
+                        # 64 是随便定的。世界上最长的 IANA 时区名才 30 出头
+                        # （America/Argentina/ComodRivadavia，去查了，真的存在）。
+                        # 留一倍余量，剩下的当有人手滑。
+                        return JSONResponse(
+                            {"error": "timezone 名称过长"}, status_code=400
+                        )
+                    try:
+                        from zoneinfo import ZoneInfo
+
+                        ZoneInfo(raw_tz)
+                    except Exception:
+                        return JSONResponse(
+                            {
+                                "error": (
+                                    f"无法识别时区「{raw_tz}」。请使用 IANA 时区名，"
+                                    "例如 Asia/Shanghai、UTC、America/New_York。"
+                                )
+                            },
+                            status_code=400,
+                        )
+                timezone_value = raw_tz
+
+            surfacing_values: dict[str, int] = {}
+            surfacing_payload = body.get("surfacing") or {}
+            for key, low, high in (
+                ("breath_max_results", 1, 50),
+                ("breath_max_tokens", 500, 40000),
+                ("feel_max_tokens", 500, 20000),
+            ):
+                if key in surfacing_payload:
+                    surfacing_values[key] = _bounded_config_int(
+                        surfacing_payload[key], f"surfacing.{key}", low, high
+                    )
             deployment_payload = body.get("deployment")
             if "deployment" in body and not isinstance(deployment_payload, dict):
                 return JSONResponse(
@@ -383,6 +532,29 @@ def register(mcp) -> None:
                 and "enabled" in sampling_payload
                 else None
             )
+            sampling_values: dict[str, int | float] = {}
+            if isinstance(sampling_payload, dict):
+                if "top_k" in sampling_payload:
+                    sampling_values["top_k"] = _bounded_config_int(
+                        sampling_payload["top_k"],
+                        "surfacing.sampling.top_k",
+                        1,
+                        50,
+                    )
+                if "sample_k" in sampling_payload:
+                    sampling_values["sample_k"] = _bounded_config_int(
+                        sampling_payload["sample_k"],
+                        "surfacing.sampling.sample_k",
+                        1,
+                        20,
+                    )
+                if "temperature" in sampling_payload:
+                    sampling_values["temperature"] = _bounded_config_float(
+                        sampling_payload["temperature"],
+                        "surfacing.sampling.temperature",
+                        0.1,
+                        5.0,
+                    )
         except ValueError as e:
             return JSONResponse({"error": str(e)}, status_code=400)
 
@@ -401,36 +573,115 @@ def register(mcp) -> None:
                 },
                 status_code=400,
             )
+        hot_update_keys = {
+            "dehydration",
+            "embedding",
+            "merge_threshold",
+            "host_port",
+            "surfacing",
+            "timezone",
+        }
+        if startup_setting_requested and hot_update_keys.intersection(body):
+            return JSONResponse(
+                {
+                    "error": (
+                        "MCP startup settings cannot be combined with hot runtime "
+                        "settings; save them in separate requests"
+                    )
+                },
+                status_code=400,
+            )
+
+        mcp_network_security: dict | None = None
+        if mcp_auth_value is False:
+            # 先于任何热配置变更执行，避免同一请求稍后因危险鉴权设置被拒绝时，
+            # 其他字段却已经部分生效；原子写入锁内还会基于最新磁盘配置再检查一次。
+            security_candidate = dict(sh.config)
+            security_candidate["mcp_require_auth"] = False
+            mcp_network_security = assess_mcp_network_safety(
+                security_candidate,
+                environment=os.environ,
+                in_docker=sh.in_docker(),
+            )
+            security_issue = mcp_network_safety_issue(mcp_network_security)
+            if security_issue:
+                return JSONResponse({
+                    "error": security_issue,
+                    "mcp_network_security": mcp_network_security,
+                }, status_code=400)
+
+        runtime_config_before = copy.deepcopy(sh.config)
+        embedding_before = sh.embedding_engine
+        dehydrator_fields = (
+            "model",
+            "base_url",
+            "max_tokens",
+            "temperature",
+            "timeout_seconds",
+            "api_format",
+            "extra_body",
+            "api_key",
+            "api_available",
+            "client",
+        )
+        dehydrator_before = {
+            field: getattr(sh.dehydrator, field)
+            for field in dehydrator_fields
+            if hasattr(sh.dehydrator, field)
+        }
+
+        def _rollback_hot_runtime() -> None:
+            """在验证或持久化失败时恢复同一份运行态快照。"""
+            sh.config.clear()
+            sh.config.update(copy.deepcopy(runtime_config_before))
+            for field, value in dehydrator_before.items():
+                setattr(sh.dehydrator, field, value)
+            if sh.embedding_engine is not embedding_before:
+                sh.replace_embedding_engine(embedding_before)
 
         # --- Dehydration config ---
         if "dehydration" in body:
-            d = body["dehydration"]
+            d = dehydration_payload
             dehy = sh.config.setdefault("dehydration", {})
-            for key in ("model", "base_url", "max_tokens", "temperature", "api_format", "timeout_seconds"):
+            for key in ("model", "base_url", "max_tokens", "temperature", "api_format", "timeout_seconds", "extra_body"):
                 if key in d:
                     dehy[key] = d[key]
                     updated.append(f"dehydration.{key}")
             if "api_key" in d and d["api_key"]:
                 dehy["api_key"] = d["api_key"]
                 updated.append("dehydration.api_key")
-            # Hot-reload dehydrator — sync ALL attributes so dashboard changes take effect immediately
+            # 热重载压缩器：同步所有属性，让 Dashboard 修改立即生效。
             sh.dehydrator.model = dehy.get("model", sh.dehydrator.model)
             sh.dehydrator.base_url = dehy.get("base_url", sh.dehydrator.base_url)
             sh.dehydrator.max_tokens = int(dehy.get("max_tokens") or sh.dehydrator.max_tokens)
-            sh.dehydrator.temperature = float(dehy.get("temperature") or sh.dehydrator.temperature)
+            configured_temperature = dehy.get("temperature")
+            if configured_temperature is not None:
+                sh.dehydrator.temperature = float(configured_temperature)
             sh.dehydrator.timeout_seconds = _positive_float(dehy.get("timeout_seconds"), sh.dehydrator.timeout_seconds)
             sh.dehydrator.api_format = dehy.get("api_format", getattr(sh.dehydrator, "api_format", "openai_compat"))
+            sh.dehydrator.extra_body = dict(dehy.get("extra_body") or {})
             if "api_key" in d and d["api_key"]:
                 sh.dehydrator.api_key = dehy["api_key"]
             sh.dehydrator.api_available = bool(sh.dehydrator.api_key)
-            # Rebuild OpenAI-compat client whenever key or url changes
+            # 密钥或 URL 改变时重建 OpenAI 兼容客户端。
             if sh.dehydrator.api_available and sh.dehydrator.api_format == "openai_compat":
                 from openai import AsyncOpenAI
-                sh.dehydrator.client = AsyncOpenAI(
-                    api_key=sh.dehydrator.api_key,
-                    base_url=sh.dehydrator.base_url,
-                    timeout=sh.dehydrator.timeout_seconds,
-                )
+                try:
+                    sh.dehydrator.client = AsyncOpenAI(
+                        api_key=sh.dehydrator.api_key,
+                        base_url=sh.dehydrator.base_url,
+                        timeout=sh.dehydrator.timeout_seconds,
+                    )
+                except Exception as exc:
+                    _rollback_hot_runtime()
+                    logger.warning(
+                        "dehydration reload failed: err_type=%s detail=hidden",
+                        type(exc).__name__,
+                    )
+                    return JSONResponse(
+                        {"error": "dehydration reload failed"},
+                        status_code=400,
+                    )
             else:
                 sh.dehydrator.client = None
 
@@ -464,25 +715,31 @@ def register(mcp) -> None:
                 updated.append("embedding.backend")
                 rebuild_embedding = True
 
-            # One request may change several fields. Rebuild once, then publish
-            # the same instance to web routes, BucketManager, ImportEngine and
-            # the MCP tools runtime so reads and writes cannot split models.
+            # 一个请求可能修改多个字段；只重建一次，再把同一实例发布给 Web 路由、
+            # BucketManager、ImportEngine 和 MCP 工具运行时，避免读写使用不同模型。
             if rebuild_embedding:
                 try:
                     _rebuild_embedding_runtime()
                 except Exception as e:
+                    _rollback_hot_runtime()
+                    logger.warning(
+                        "embedding reload failed: err_type=%s detail=hidden",
+                        type(e).__name__,
+                    )
                     return JSONResponse(
-                        {"error": f"embedding reload failed: {e}"},
+                        {"error": "embedding reload failed"},
                         status_code=400,
                     )
 
         # --- Merge threshold ---
-        if "merge_threshold" in body:
-            try:
-                sh.config["merge_threshold"] = int(body["merge_threshold"])
-                updated.append("merge_threshold")
-            except (TypeError, ValueError):
-                pass
+        if merge_threshold_value is not None:
+            sh.config["merge_threshold"] = merge_threshold_value
+            updated.append("merge_threshold")
+
+        # --- Timezone ---
+        if timezone_value is not None:
+            sh.config["timezone"] = timezone_value
+            updated.append("timezone")
 
         # MCP 鉴权开关、鉴权模式与公网地址都是启动期快照。它们只写入
         # config.yaml，不能提前发布到 sh.config；否则 OAuth/MCP 中间件仍使用
@@ -493,28 +750,16 @@ def register(mcp) -> None:
         # 裸机：写 config 后进程自重启即监听新端口（前端「保存并重启」）。
         # Docker：容器内端口由 Dockerfile 固定，host_port 仅供部署脚本读取注入
         # OMBRE_HOST_PORT，须重建容器才生效（前端会提示）。
-        if "host_port" in body:
-            try:
-                sh.config["host_port"] = int(body["host_port"])
-                updated.append("host_port")
-            except (TypeError, ValueError):
-                pass
+        if host_port_value is not None:
+            sh.config["host_port"] = host_port_value
+            updated.append("host_port")
 
         # --- Surfacing defaults (breath/feel token & result caps) ---
         if "surfacing" in body and isinstance(body["surfacing"], dict):
             sf = sh.config.setdefault("surfacing", {})
-            for key, lo, hi in (
-                ("breath_max_results", 1, 50),
-                ("breath_max_tokens", 500, 20000),
-                ("feel_max_tokens", 500, 20000),
-            ):
-                if key in body["surfacing"]:
-                    try:
-                        val = int(body["surfacing"][key])
-                        sf[key] = max(lo, min(hi, val))
-                        updated.append(f"surfacing.{key}")
-                    except (TypeError, ValueError):
-                        pass
+            for key, value in surfacing_values.items():
+                sf[key] = value
+                updated.append(f"surfacing.{key}")
 
         persisted_after: dict | None = None
 
@@ -526,9 +771,9 @@ def register(mcp) -> None:
                     if not isinstance(sc_dehy, dict):
                         sc_dehy = {}
                         save_config["dehydration"] = sc_dehy
-                    for key in ("model", "base_url", "max_tokens", "temperature", "api_format", "timeout_seconds"):
-                        if key in body["dehydration"]:
-                            sc_dehy[key] = body["dehydration"][key]
+                    for key in ("model", "base_url", "max_tokens", "temperature", "api_format", "timeout_seconds", "extra_body"):
+                        if key in dehydration_payload:
+                            sc_dehy[key] = dehydration_payload[key]
                     # Never persist api_key to yaml (use env var)
 
                 if "embedding" in body:
@@ -544,54 +789,48 @@ def register(mcp) -> None:
                     if embedding_backend is not None:
                         sc_emb["backend"] = embedding_backend
 
-                if "merge_threshold" in body:
-                    try:
-                        save_config["merge_threshold"] = int(body["merge_threshold"])
-                    except (TypeError, ValueError):
-                        pass
+                if merge_threshold_value is not None:
+                    save_config["merge_threshold"] = merge_threshold_value
+
+                if timezone_value is not None:
+                    save_config["timezone"] = timezone_value
 
                 if mcp_auth_value is not None:
+                    security_candidate = dict(save_config)
+                    security_candidate.setdefault("transport", runtime_transport)
+                    security_candidate["mcp_require_auth"] = mcp_auth_value
+                    latest_security = assess_mcp_network_safety(
+                        security_candidate,
+                        environment=os.environ,
+                        in_docker=sh.in_docker(),
+                    )
+                    security_issue = mcp_network_safety_issue(latest_security)
+                    if security_issue:
+                        raise ValueError(security_issue)
                     save_config["mcp_require_auth"] = mcp_auth_value
 
                 if mcp_auth_mode_value is not None:
                     save_config["mcp_auth_mode"] = mcp_auth_mode_value
 
-                if "host_port" in body:
-                    try:
-                        save_config["host_port"] = int(body["host_port"])
-                    except (TypeError, ValueError):
-                        pass
+                if host_port_value is not None:
+                    save_config["host_port"] = host_port_value
 
                 if "surfacing" in body and isinstance(body["surfacing"], dict):
                     sc_sf = save_config.setdefault("surfacing", {})
                     if not isinstance(sc_sf, dict):
                         sc_sf = {}
                         save_config["surfacing"] = sc_sf
-                    for key in ("breath_max_results", "breath_max_tokens", "feel_max_tokens"):
-                        if key in body["surfacing"]:
-                            try:
-                                sc_sf[key] = int(body["surfacing"][key])
-                            except (TypeError, ValueError):
-                                pass
+                    for key, value in surfacing_values.items():
+                        sc_sf[key] = value
                     if "sampling" in body["surfacing"] and isinstance(body["surfacing"]["sampling"], dict):
                         sc_samp = sc_sf.setdefault("sampling", {})
                         if not isinstance(sc_samp, dict):
                             sc_samp = {}
                             sc_sf["sampling"] = sc_samp
-                        src_samp = body["surfacing"]["sampling"]
                         if sampling_enabled is not None:
                             sc_samp["enabled"] = sampling_enabled
-                        for key in ("top_k", "sample_k"):
-                            if key in src_samp:
-                                try:
-                                    sc_samp[key] = int(src_samp[key])
-                                except (TypeError, ValueError):
-                                    pass
-                        if "temperature" in src_samp:
-                            try:
-                                sc_samp["temperature"] = float(src_samp["temperature"])
-                            except (TypeError, ValueError):
-                                pass
+                        for key, value in sampling_values.items():
+                            sc_samp[key] = value
 
                 if deployment_public_url is not None:
                     sc_deployment = save_config.get("deployment")
@@ -612,14 +851,37 @@ def register(mcp) -> None:
                     updated.append("mcp_auth_mode")
                 if deployment_public_url is not None:
                     updated.append("deployment.public_url")
+            except ValueError as e:
+                _rollback_hot_runtime()
+                return JSONResponse({"error": str(e), "updated": []}, status_code=400)
             except Exception as e:
-                return JSONResponse({"error": f"persist failed: {e}", "updated": updated}, status_code=500)
+                _rollback_hot_runtime()
+                logger.error(
+                    "config persist failed: err_type=%s detail=hidden",
+                    type(e).__name__,
+                )
+                return JSONResponse(
+                    {"error": "persist failed", "updated": []},
+                    status_code=500,
+                )
 
         desired = _desired_startup_state(
             persisted_after if persisted_after is not None else sh.config
         )
+        runtime_network_security = _runtime_network_security(
+            desired["mcp_require_auth"]
+        )
+        auth_environment_conflict = (
+            runtime_network_security.get("auth_environment_override")
+            and runtime_network_security.get("auth_environment_value")
+            != desired["mcp_require_auth"]
+        )
         restart_required = (
-            desired["mcp_require_auth"] != runtime_mcp_auth_required
+            (
+                desired["mcp_require_auth"] != runtime_mcp_auth_required
+                and not runtime_network_security.get("guard_active")
+                and not runtime_network_security.get("auth_environment_override")
+            )
             or desired["mcp_auth_mode"] != runtime_mcp_auth_mode
             or desired["transport"] != runtime_transport
             or desired["public_url"] != runtime_public_url
@@ -634,19 +896,42 @@ def register(mcp) -> None:
             "transport_effective": runtime_transport,
             "mcp_require_auth": desired["mcp_require_auth"],
             "mcp_auth_mode": desired["mcp_auth_mode"],
+            "mcp_network_security": runtime_network_security,
+            "warnings": (
+                (
+                    [runtime_network_security["reason"]]
+                    if runtime_network_security.get("override_active") else []
+                )
+                + (
+                    [
+                        "OMBRE_MCP_REQUIRE_AUTH 仍由平台环境变量控制；"
+                        "请在部署平台修改或删除该变量后重建/重启服务。"
+                    ]
+                    if auth_environment_conflict else []
+                )
+            ),
             "deployment": {
                 "public_url": desired["public_url"],
                 "public_url_effective": runtime_public_url,
             },
             "message": (
-                "MCP 启动配置已保存，需要重启服务后生效。"
-                if restart_required else "设置已生效。"
+                "设置已保存；当前配置或环境仍请求免鉴权，安全门禁继续强制鉴权。"
+                if runtime_network_security.get("guard_active")
+                else (
+                    "设置已保存，但 OMBRE_MCP_REQUIRE_AUTH 仍由平台环境变量控制；"
+                    "请在部署平台修改或删除该变量后重建/重启服务。"
+                    if auth_environment_conflict
+                    else (
+                        "MCP 启动配置已保存，需要重启服务后生效。"
+                        if restart_required else "设置已生效。"
+                    )
+                )
             ),
         })
 
 
     # =============================================================
-    # /api/mcp-token/regenerate — 生成/轮换 mcp_auth_mode=token 用的静态密钥
+    # /api/mcp-token/regenerate — 生成/轮换 token/hybrid 模式使用的静态密钥
     # 独立成一个小路由（而不是塞进 POST /api/config）：生成新密钥和改配置项
     # 是两件不同的事，参照 oauth.py 里 token 签发自成一块的做法。
     # =============================================================
@@ -656,8 +941,9 @@ def register(mcp) -> None:
 
         Returns the plaintext token exactly once — GET /api/config only ever
         returns a masked hint, so the Dashboard must capture this response.
-        Takes effect immediately (no restart needed): _is_valid_static_mcp_token
-        reads sh.config/env fresh on every request.
+        Takes effect immediately when the running process is already in token
+        or hybrid mode: _is_valid_static_mcp_token reads sh.config/env fresh on
+        every request. A newly selected auth mode still requires a restart.
         """
         from starlette.responses import JSONResponse
         err = sh._require_auth(request)
@@ -665,12 +951,25 @@ def register(mcp) -> None:
             return err
 
         new_token = secrets.token_urlsafe(32)
-        sh.config["mcp_token"] = new_token
 
-        try:
-            atomic_update_config_yaml(lambda save_config: save_config.__setitem__("mcp_token", new_token))
-        except Exception as e:
-            return JSONResponse({"error": f"persist failed: {e}"}, status_code=500)
+        # 原生锁覆盖“落盘 + 发布”整个提交段，且临界区内没有 await；既避免
+        # 并发请求发生磁盘 B、运行态 A 的逆序，也不产生 asyncio 跨循环绑定。
+        with mcp_token_commit_lock:
+            try:
+                atomic_update_config_yaml(
+                    lambda save_config: save_config.__setitem__(
+                        "mcp_token", new_token
+                    )
+                )
+            except Exception as e:
+                return JSONResponse(
+                    {"error": f"persist failed: {e}"}, status_code=500
+                )
+
+            # 鉴权每次请求都直接读取 sh.config；必须先确认持久化成功，再发布运行态。
+            # 否则磁盘写失败时接口虽然返回 500，新 token 却已经即时生效，重启后又
+            # 回到旧 token，形成无法从响应判断的临时授权状态。
+            sh.config["mcp_token"] = new_token
 
         env_override = bool(os.environ.get("OMBRE_MCP_TOKEN", "").strip())
         return JSONResponse({
@@ -683,7 +982,7 @@ def register(mcp) -> None:
                 "请改用该环境变量或先取消设置它。"
                 if env_override
                 else "新 Token 已生成并保存，请立即复制；刷新页面后不再显示完整值。"
-                     "重新生成立即生效，无需重启。"
+                     "当前进程已处于 Token/共存模式时立即生效；刚切换模式仍需重启。"
             ),
         })
 
@@ -707,7 +1006,11 @@ def register(mcp) -> None:
         try:
             import httpx as _httpx
             headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-            payload = {"model": model, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 5}
+            payload = {
+                "model": model,
+                "messages": [{"role": "user", "content": "hi"}],
+                **chat_completion_token_limit(model, 5),
+            }
             async with _httpx.AsyncClient(timeout=15) as client:
                 r = await client.post(f"{base_url.rstrip('/')}/chat/completions", json=payload, headers=headers)
             if r.status_code in (200, 201):
@@ -1155,17 +1458,18 @@ def register(mcp) -> None:
         return JSONResponse(response)
 
 
-    # --- 传输模式热切换：streamable-http / stdio / sse（legacy）---
-    # transport 是「启动时绑定」的（server.py 据此起 streamable_http_app / sse_app / stdio），
+    # --- 传输模式热切换：streamable-http / stdio ---
+    # transport 是「启动时绑定」的（server.py 据此起 streamable_http_app / stdio），
     # 运行中无法无缝切换，所以这里的做法是：持久化新值 → 原地自重启（os.execv 继承已改的
     # os.environ，绕过 compose 里硬编码的旧 OMBRE_TRANSPORT）→ 新进程按新 transport 起。
-    _TRANSPORT_CHOICES = ("streamable-http", "sse", "stdio")
+    # 2026-08-09 起 legacy SSE（"sse"）已下线，不再是可选项。
+    _TRANSPORT_CHOICES = ("streamable-http", "stdio")
 
     @mcp.custom_route("/api/transport", methods=["POST"])
     async def api_transport_set(request: Request) -> Response:
         """切换 MCP 传输模式并自重启生效。
 
-        Body (JSON): {"transport": "streamable-http" | "sse" | "stdio"}
+        Body (JSON): {"transport": "streamable-http" | "stdio"}
 
         ⚠️ stdio 没有 HTTP 服务：切到 stdio 后 Dashboard / REST / /mcp(HTTP) 全部消失，
         且无法再从网页切回（需在服务器改 config.yaml / env 恢复）。前端对此二次确认。

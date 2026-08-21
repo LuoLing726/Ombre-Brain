@@ -4,7 +4,9 @@ do-update 会把远端 zip 覆盖到 src/ 并（旧行为）自动 pip install�
 config.update」放大成 RCE。默认只信官方仓、自动 pip 默认关闭。
 """
 import hashlib
+import re
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -75,6 +77,35 @@ def test_hot_update_defaults_to_same_main_branch_as_version_check():
     assert '_ucfg.get("channel") or "branch"' in source
 
 
+def test_ci_lock_verification_freezes_package_index_snapshot():
+    repo_root = Path(meta.__file__).resolve().parents[2]
+    workflow = (repo_root / ".github" / "workflows" / "tests.yml").read_text(
+        encoding="utf-8"
+    )
+    _, remainder = workflow.split("      - name: Verify dependency lockfiles", 1)
+    step = remainder.split("\n      - name:", 1)[0]
+
+    match = re.search(
+        r"(?m)^\s+UV_EXCLUDE_NEWER:\s*['\"]([^'\"]+)['\"]\s*$",
+        step,
+    )
+    assert match, "lock 校验必须固定包索引时间，避免无输入变更时发生解析漂移"
+    cutoff_text = match.group(1)
+    assert cutoff_text.endswith("Z"), "lock 索引时间必须使用明确的 UTC 时间"
+    cutoff = datetime.fromisoformat(cutoff_text[:-1] + "+00:00")
+    assert cutoff.tzinfo == timezone.utc
+    assert cutoff <= datetime.now(timezone.utc)
+
+    assert step.count("uv pip compile ") == 2
+    assert "--upgrade" not in step
+    assert "--exclude-newer" not in step, (
+        "cutoff 必须通过环境变量传入，避免 uv 把参数写进 lock 头部造成纯文本漂移"
+    )
+    reset_command = "rm -f requirements.lock.txt requirements-dev.lock.txt"
+    assert reset_command in step, "lock 校验必须从空输出重建，不能依赖已有 pin 偏好"
+    assert step.index(reset_command) < step.index("uv pip compile ")
+
+
 def test_release_archive_omits_loose_requirements_but_keeps_lock():
     repo_root = Path(meta.__file__).resolve().parents[2]
     attributes = (repo_root / ".gitattributes").read_text(encoding="utf-8")
@@ -92,15 +123,25 @@ def test_release_archive_omits_loose_requirements_but_keeps_lock():
 
 
 def test_legacy_archive_compatibility_requires_284_release_lock():
+    """requirements.lock.txt 内容钉死的绊线：任何改动都必须是一次清醒决定，不能顺手改掉。
+
+    2026-08-09：为修复 cryptography==49.0.0 的 PYSEC-2026-3552（无 fix 版本可选，
+    只能升级到 50.0.0），推进了 CI 的 UV_EXCLUDE_NEWER 快照并重新生成了两份锁，
+    连带升级了 mcp/openai/uvicorn 等包。这是一次明确接受的破坏性变更：仍在跑
+    v2.8.4 之前旧更新器逻辑、且尚未升级过一次的部署实例，这次热更新后可能无法
+    再走旧的 legacy 依赖回退路径，需要用户手动升级一次。基线哈希已推进到新内容；
+    下一次改锁文件时，请再一次有意识地评估这条兼容性问题，而不是让测试直接绿。
+    """
     repo_root = Path(meta.__file__).resolve().parents[2]
     lock_bytes = (repo_root / "requirements.lock.txt").read_bytes()
     normalized = lock_bytes.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
 
     assert hashlib.sha256(normalized).hexdigest() == (
-        "fdb24053349d8e18a55c3a5afbab8b92cc31d94b69e52359b350ab96b79001c9"
+        "08c58fcf67ab7245499faf0de69085d32185d500a3a9d19f6d9e6fda0bd0a939"
     ), (
-        "requirements.lock.txt 已变化：发布前必须先移除 requirements.txt 的 "
-        "export-ignore 兼容规则，并为旧更新器设计显式依赖迁移"
+        "requirements.lock.txt 已变化：确认这次变化是否会影响还没升级过的旧版"
+        "热更新器（尤其 v2.8.4 之前、缺少 lock 感知回退逻辑的实例），评估后再把"
+        "这里的基线哈希推进到新内容"
     )
 
 
@@ -153,6 +194,7 @@ def test_dependency_check_without_any_baseline_remains_fail_closed(
 ):
     monkeypatch.delenv("OMBRE_IMAGE_ROOT", raising=False)
     monkeypatch.setattr(sh, "in_docker", lambda: False)
+    monkeypatch.setattr(meta, "_runtime_satisfies_locked_versions", lambda _data: False)
 
     assert meta._requirements_changed(
         str(tmp_path), b"new-package==1\n", b"new-package==1 --hash=sha256:abc\n"
@@ -167,12 +209,136 @@ def test_new_lock_never_falls_back_to_matching_source_without_lock_baseline(
 ):
     monkeypatch.delenv("OMBRE_IMAGE_ROOT", raising=False)
     monkeypatch.setattr(sh, "in_docker", lambda: False)
+    monkeypatch.setattr(meta, "_runtime_satisfies_locked_versions", lambda _data: False)
     source = b"package>=1\n"
     (tmp_path / "requirements.txt").write_bytes(source)
 
     assert meta._requirements_changed(
         str(tmp_path), source, b"package==1 --hash=sha256:abc\n"
     ) is True
+
+
+def test_missing_lock_baseline_accepts_exactly_satisfied_runtime(monkeypatch, tmp_path):
+    monkeypatch.delenv("OMBRE_IMAGE_ROOT", raising=False)
+    monkeypatch.setattr(sh, "in_docker", lambda: False)
+    checked = []
+
+    def satisfied(data):
+        checked.append(data)
+        return True
+
+    monkeypatch.setattr(meta, "_runtime_satisfies_locked_versions", satisfied)
+    lock = b"package==1 \\\n    --hash=sha256:" + b"a" * 64 + b"\n"
+
+    assert meta._requirements_changed(str(tmp_path), None, lock) is False
+    assert checked == [meta._normalize_dependency_manifest(lock)]
+
+
+def test_changed_lock_remains_changed_even_if_runtime_probe_would_pass(
+    monkeypatch, tmp_path
+):
+    (tmp_path / "requirements.lock.txt").write_bytes(b"package==1\n")
+
+    def unexpected_probe(_data):
+        raise AssertionError("已有 lock 不同属于真实迁移，不应走缺基线兼容探测")
+
+    monkeypatch.setattr(meta, "_runtime_satisfies_locked_versions", unexpected_probe)
+
+    assert meta._requirements_changed(
+        str(tmp_path), None, b"package==2 --hash=sha256:" + b"b" * 64 + b"\n"
+    ) is True
+
+
+def test_runtime_lock_probe_is_local_read_only_and_cleans_temp_file(
+    monkeypatch, tmp_path
+):
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        requirement_path = Path(command[-1])
+        captured["path"] = requirement_path
+        captured["content"] = requirement_path.read_bytes()
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    lock = b"package==1 \\\n    --hash=sha256:" + b"c" * 64 + b"\n"
+
+    assert meta._runtime_satisfies_locked_versions(lock) is True
+    command = captured["command"]
+    assert "--dry-run" in command
+    assert "--no-index" in command
+    assert "--no-deps" in command
+    assert "--require-hashes" in command
+    assert "--no-cache-dir" in command
+    assert captured["kwargs"]["timeout"] == 60
+    assert captured["content"] == lock
+    assert not captured["path"].exists()
+
+
+def test_runtime_lock_probe_accepts_repository_release_lock_syntax(monkeypatch):
+    repo_root = Path(meta.__file__).resolve().parents[2]
+    captured = {}
+
+    def fake_run(command, **_kwargs):
+        captured["content"] = Path(command[-1]).read_bytes()
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    lock = (repo_root / "requirements.lock.txt").read_bytes()
+
+    assert meta._runtime_satisfies_locked_versions(lock) is True
+    assert b"mcp==1.29.0" in captured["content"]
+
+
+def test_runtime_lock_probe_nonzero_result_fails_closed_and_cleans_temp(
+    monkeypatch,
+):
+    captured = {}
+
+    def fake_run(command, **_kwargs):
+        captured["path"] = Path(command[-1])
+        return subprocess.CompletedProcess(command, 1)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    lock = b"package==1 \\\n    --hash=sha256:" + b"e" * 64 + b"\n"
+
+    assert meta._runtime_satisfies_locked_versions(lock) is False
+    assert not captured["path"].exists()
+
+
+def test_runtime_lock_probe_timeout_and_invalid_utf8_fail_closed(monkeypatch):
+    captured = {}
+
+    def timeout(command, **_kwargs):
+        captured["path"] = Path(command[-1])
+        raise subprocess.TimeoutExpired(command, 60)
+
+    monkeypatch.setattr(subprocess, "run", timeout)
+    lock = b"package==1 \\\n    --hash=sha256:" + b"f" * 64 + b"\n"
+
+    assert meta._runtime_satisfies_locked_versions(lock) is False
+    assert not captured["path"].exists()
+    assert meta._runtime_satisfies_locked_versions(b"package==1\n\xff") is False
+
+
+@pytest.mark.parametrize(
+    "lock",
+    [
+        b"--index-url=https://attacker.invalid/simple\npackage==1\n",
+        b"package @ https://attacker.invalid/package.whl#sha256=abc\n",
+        b"-e ../local-package\n",
+        b"package==1\n",
+        b"package>=1 --hash=sha256:" + b"d" * 64 + b"\n",
+    ],
+)
+def test_runtime_lock_probe_rejects_unsafe_or_unhashed_syntax(monkeypatch, lock):
+    def unexpected_run(*_args, **_kwargs):
+        raise AssertionError("不安全 lock 不能交给 pip 解析")
+
+    monkeypatch.setattr(subprocess, "run", unexpected_run)
+    assert meta._runtime_satisfies_locked_versions(lock) is False
 
 
 def test_lock_install_enforces_hashes(monkeypatch, tmp_path):
