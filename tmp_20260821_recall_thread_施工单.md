@@ -71,3 +71,37 @@
 ## 环境变量 / 路径依赖
 
 - 本批改动不新增、不修改任何环境变量，不新增磁盘路径。
+
+---
+
+# 建边篇：event_time + references（8月21日，方案已对齐）
+
+> 决策来源：铃铃便签 002（event_time 谁来填）、003（建边类型复用+只新增 references）。
+
+## 结论
+
+- **event_time**：hold 时模型主动填（可选参数，默认 created）；系统解析只兜底且"唯一明确日期才填、含糊不猜"（**本轮不做解析**，只做 manual + fallback）。来源打标 manual/parsed/fallback。
+- **建边**：三层边是"怎么发现"（来源策略），现有类型是"存成什么"（语义），解耦。≈同刻→same_event、之前/之后→continuation_of、相关→related_to 均已有；唯一新增 references（有向，反向 referenced_by）。caused_by/causes 原样保留，只增量不迁移。
+- **本次最小集**：1 字段(event_time) + 1 类型(references) + thread/recall 接到现有类型。
+
+## 改动清单（9 文件，从底层往上）
+
+1. `src/ombrebrain/storage/relation_store.py`：_FIXED_RELATION_TYPES + references/referenced_by；_REVERSE；display label（引用/被引用）；DIRECTION_GROUPS 加 references（🔗 引用）。
+2. `src/bucket_manager.py` create()：加 event_time（落 metadata.event_time，来源 manual；不传不写，读侧回退 created）、references（落 relation_links 的 references 边，auto=False）。
+3. `src/tools/thread/core.py`：排序优先 event_time，回退 created；bucket_date 优先 event_time。
+4. `src/tools/_common.py`：merge_or_create + _merge_or_create_inner 透传 event_time/references。
+5. `src/tools/hold/core.py`：store_core 透传。
+6. `src/tools/hold/feel.py`、`pinned.py`：store_feel/store_pinned 透传（直调 create）。
+7. `src/tools/hold/__init__.py` dispatch：加参数 + 转发。
+8. `src/server.py`：hold 工具签名 + docstring 加 event_time/references。
+9. `tests/`：新增测试（event_time 排序、references 边渲染）。
+
+## 关键用例（铃铃给的一手证据）
+
+- 「重逢的告白」(ea95dbdd78f7) references 「自度的菩萨」(1d5976ea4970)，两桶 event_time 都是 2025-12-05（回溯记忆，created 是 2026-08-10）。thread 排序必须用 event_time 才能串对。
+
+## 状态（8月21日）
+
+- ✅ 已完成：写侧（create + 三条 hold 路径透传 event_time/references）+ 读侧（thread 排序、bucket_date、references 边渲染）+ 测试。
+- 版本：3.3.0 → 3.4.0。
+- ⬜ 待做（后续可选）：event_time 系统解析兜底（parsed 来源）；references 反向边自动补齐（dream 全量重建时）。

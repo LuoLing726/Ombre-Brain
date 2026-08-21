@@ -41,7 +41,10 @@ def _is_archived(meta: dict) -> bool:
 
 
 def _parse_created(meta: dict):
-    raw = str((meta or {}).get("created") or "").strip()
+    """优先 event_time（事情发生时间），回退 created（记下时间）。"""
+    raw = str((meta or {}).get("event_time") or "").strip()
+    if not raw:
+        raw = str((meta or {}).get("created") or "").strip()
     if not raw:
         return None
     try:
@@ -95,7 +98,8 @@ async def thread(query: str, max_results: int = 0) -> str:
     if not stations:
         return f"我没有找到和「{query}」串得起来的记忆——它可能还没被记下，或者我还说不上这条线。"
 
-    # 按创建时间升序：最早 → 现在。缺 created 的放最后（不猜时间）。
+    # 按事件时间升序：最早发生 → 现在。event_time 缺失时回退 created；
+    # 两者都缺的放最后（不猜时间）。
     def _sort_key(bucket):
         dt = _parse_created(bucket.get("metadata") or {})
         return (dt is None, dt or datetime.max.replace(tzinfo=None))

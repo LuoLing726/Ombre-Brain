@@ -10,7 +10,7 @@ MAX_RELATION_TYPE_CHARS = 32
 MAX_RELATION_ID_CHARS = 64
 _FIXED_RELATION_TYPES = frozenset({
     "caused_by", "causes", "continuation_of", "continues", "related_to",
-    "same_event",
+    "same_event", "references", "referenced_by",
 })
 _RELATION_TYPES = _FIXED_RELATION_TYPES | {"custom"}
 _REVERSE_RELATION_TYPES = {
@@ -20,6 +20,8 @@ _REVERSE_RELATION_TYPES = {
     "continues": "continuation_of",
     "related_to": "related_to",
     "same_event": "same_event",
+    "references": "referenced_by",
+    "referenced_by": "references",
     "custom": "custom",
 }
 _DEFAULT_DISPLAY_LABELS = {
@@ -29,6 +31,8 @@ _DEFAULT_DISPLAY_LABELS = {
     "continues": "后续",
     "related_to": "相关",
     "same_event": "同一事件",
+    "references": "引用",
+    "referenced_by": "被引用",
 }
 
 
@@ -121,7 +125,7 @@ def normalize_relation_type(value: Any) -> str:
         raise ValueError("relation_type 必须是字符串安全键")
     value = value.strip().lower()
     if value not in _RELATION_TYPES:
-        raise ValueError("relation_type must be one of the six fixed types or custom")
+        raise ValueError("relation_type must be one of the fixed types or custom")
     return value
 
 
@@ -237,7 +241,8 @@ EXCLUDED_RELATION_TYPES = frozenset({
 })
 
 # 路口分组的展示顺序：时间方向在前，相关/自定义殿后——
-# 让「沿着时间往回走」的顺序自然：因为 → 之前 → 同刻 → 之后 → 所以 → 相关。
+# 让「沿着时间往回走」的顺序自然：因为 → 之前 → 同刻 → 之后 → 所以 → 相关 → 引用。
+# references 是「我自己写下的强关系」，放在相关之后、自定义之前。
 DIRECTION_GROUPS = (
     ("caused_by", "← 因为"),
     ("continuation_of", "← 之前"),
@@ -245,6 +250,8 @@ DIRECTION_GROUPS = (
     ("continues", "→ 之后"),
     ("causes", "→ 所以"),
     ("related_to", "↔ 相关"),
+    ("references", "🔗 引用"),
+    ("referenced_by", "🔗 被引用"),
 )
 
 
@@ -270,8 +277,11 @@ def bucket_title(bucket: dict) -> str:
 
 
 def bucket_date(meta: dict) -> str:
-    created = str((meta or {}).get("created") or "").strip()
-    return created[:10] if created else ""
+    """优先 event_time（事情发生的时间），回退 created（记下的时间）。"""
+    raw = str((meta or {}).get("event_time") or "").strip()
+    if not raw:
+        raw = str((meta or {}).get("created") or "").strip()
+    return raw[:10] if raw else ""
 
 
 def _direction_of(rel_type: str) -> str:

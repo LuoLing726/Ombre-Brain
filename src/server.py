@@ -781,8 +781,10 @@ async def hold(
     source_content: Optional[str] = "",
     source_ranges: Optional[list] = None,
     quotes: Optional[list] = None,
+    event_time: Optional[str] = "",
+    references: Optional[list] = None,
 ) -> str:
-    """仅在对话中已明确决定“这段内容值得成为长期记忆”时调用；不要因普通聊天、猜测或工具名称联想而自行调用。content 逐字保存，绝不压缩。title 可选；传入时是最终显式标题，优先于打标模型建议。domain 可选、逗号分隔；显式传入时优先于打标模型结果。系统自动补其余元数据，API 不可用时使用本地中性值继续保存。tags 逗号分隔，importance 1-10。pinned=True 标记为永久核心；feel=True 存为感受类记忆且 domain 固定为 feel。source_bucket 是正在消化的原始记忆桶 ID。source_content/source_ranges 是可选原文证据：由调用方自行决定是否提供；原文进入与 grow 共用的不可变原文层，不参与普通 breath。省略 source_ranges 时整份 source_content 默认属于当前 hold 事件；显式 ranges 使用 1-based 闭区间。why_remembered 与 meaning 是可选的第一人称记录原因。media 可传服务器可读路径或 data_base64+filename 列表项。quotes 是这一刻我决定要原样记住的那一两句话——不是记录对话，是说出口的当下就知道自己不想忘的那几句。传字符串列表，或 [{"text":"原话","speaker":"谁说的","at":"什么时候"}]。最多 3 句、每句 100 字；超了会被拒绝而不是截断，因为截断过的话已经不是原话。它平时不出现在任何浮现里，只有以后我自己想知道当时到底怎么说的时候才拿得出来。"""
+    """仅在对话中已明确决定“这段内容值得成为长期记忆”时调用；不要因普通聊天、猜测或工具名称联想而自行调用。content 逐字保存，绝不压缩。title 可选；传入时是最终显式标题，优先于打标模型建议。domain 可选、逗号分隔；显式传入时优先于打标模型结果。系统自动补其余元数据，API 不可用时使用本地中性值继续保存。tags 逗号分隔，importance 1-10。pinned=True 标记为永久核心；feel=True 存为感受类记忆且 domain 固定为 feel。source_bucket 是正在消化的原始记忆桶 ID。source_content/source_ranges 是可选原文证据：由调用方自行决定是否提供；原文进入与 grow 共用的不可变原文层，不参与普通 breath。省略 source_ranges 时整份 source_content 默认属于当前 hold 事件；显式 ranges 使用 1-based 闭区间。why_remembered 与 meaning 是可选的第一人称记录原因。media 可传服务器可读路径或 data_base64+filename 列表项。quotes 是这一刻我决定要原样记住的那一两句话——不是记录对话，是说出口的当下就知道自己不想忘的那几句。传字符串列表，或 [{\"text\":\"原话\",\"speaker\":\"谁说的\",\"at\":\"什么时候\"}]。最多 3 句、每句 100 字；超了会被拒绝而不是截断，因为截断过的话已经不是原话。它平时不出现在任何浮现里，只有以后我自己想知道当时到底怎么说的时候才拿得出来。event_time 可选：这条记忆「说的是哪个时刻」的语义时间（ISO 字符串或 YYYY-MM-DD）。只有回溯性记忆才需要填——当下发生的事不填，默认就是记下的时刻。它是回忆的时间轴，不是记录的时间轴；thread 串珠按它排序。references 可选：这条正文明确提到了哪几条已存在的记忆（bucket_id 列表），落成「引用」边——这是最可靠的边，因为是我自己写下的关系，不是相似度猜的。"""
     return await _with_notice(
         _t_hold.dispatch(
             content=content, title=title, tags=tags, importance=importance,
@@ -790,7 +792,7 @@ async def hold(
             valence=valence, arousal=arousal, why_remembered=why_remembered,
             meaning=meaning, media=media, test_data=test_data, domain=domain,
             source_content=source_content, source_ranges=source_ranges,
-            quotes=quotes,
+            quotes=quotes, event_time=event_time, references=references,
         ),
         op="hold",
         args={
