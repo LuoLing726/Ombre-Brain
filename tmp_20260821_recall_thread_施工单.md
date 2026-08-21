@@ -80,7 +80,7 @@
 
 ## 结论
 
-- **event_time**：hold 时模型主动填（可选参数，默认 created）；系统解析只兜底且"唯一明确日期才填、含糊不猜"（**本轮不做解析**，只做 manual + fallback）。来源打标 manual/parsed/fallback。
+- **event_time**：hold 时模型主动填（可选参数，默认 created）；系统解析兜底**不做**（定案 2026-08-21：大多数记忆「记录时刻=事件时刻」，需要特殊标注的由模型手动填、或事后用 trace(event_time=...) 修正；系统解析反而可能出错）。来源打标 manual/fallback（无 parsed 层）。优先级恒为 manual > fallback(created)。
 - **建边**：三层边是"怎么发现"（来源策略），现有类型是"存成什么"（语义），解耦。≈同刻→same_event、之前/之后→continuation_of、相关→related_to 均已有；唯一新增 references（有向，反向 referenced_by）。caused_by/causes 原样保留，只增量不迁移。
 - **本次最小集**：1 字段(event_time) + 1 类型(references) + thread/recall 接到现有类型。
 
@@ -103,5 +103,6 @@
 ## 状态（8月21日）
 
 - ✅ 已完成：写侧（create + 三条 hold 路径透传 event_time/references）+ 读侧（thread 排序、bucket_date、references 边渲染）+ 测试。
-- 版本：3.3.0 → 3.4.0。
-- ⬜ 待做（后续可选）：event_time 系统解析兜底（parsed 来源）；references 反向边自动补齐（dream 全量重建时）。
+- ✅ 已完成（3.4.1，8月21日续）：references 反向边自动补齐——dream 全量扫时幂等补 referenced_by（`collect_missing_reference_reverse` 纯判定 + `backfill_reference_reverse_links` 写入，挂 dream dispatch 的 fire-and-forget）。trace 工具新增 event_time 参数，支持事后修正（非空覆盖并标 manual）或清除（`\clear`，回到 created 回退）。
+- ❌ 不做（定案）：event_time 系统解析兜底（parsed 来源）——见上「结论」。
+- 版本：3.3.0 → 3.4.0 → 3.4.1。

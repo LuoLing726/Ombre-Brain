@@ -402,3 +402,61 @@ async def render_junction(
         parts.append("· 自定义")
         parts.extend(custom_rows)
     return "\n".join(parts)
+
+
+# ============================================================
+# references 反向边补齐（3.4.0+）
+# ------------------------------------------------------------
+# references 是模型在 hold 时手动声明的「这条正文提到了哪条桶」，落成 A→B 的
+# 单向边。被引用的 B 身上没有反向记号，导致从 B recall 时看不到这根线。
+# 这里补一条 referenced_by（B→A）反边，让线从两头都能拎起来。
+# 幂等：已有反边的不再列出。只处理非归档、非排除类型的目标桶。
+# ============================================================
+
+def collect_missing_reference_reverse(all_buckets: list[dict]) -> list[tuple[str, str]]:
+    """扫描 references 边，找出缺失 referenced_by 反边的 (被引用桶id, 引用桶id)。
+
+    返回按 (被引用, 引用) 字典序去重后的列表。不写盘，纯判定，便于单独测试。
+    """
+    if not all_buckets:
+        return []
+
+    def _active_links(meta: dict) -> list[dict]:
+        try:
+            return normalize_relation_links(meta.get("relation_links"))
+        except ValueError:
+            return []
+
+    by_id: dict[str, dict] = {}
+    for b in all_buckets:
+        bid = str((b or {}).get("id") or "").strip()
+        if not bid:
+            continue
+        meta = b.get("metadata") or {}
+        if bucket_type(meta) in EXCLUDED_RELATION_TYPES:
+            continue
+        by_id[bid] = b
+
+    missing: set[tuple[str, str]] = set()
+    for source in all_buckets:
+        smeta = source.get("metadata") or {}
+        if bucket_type(smeta) in EXCLUDED_RELATION_TYPES:
+            continue
+        sid = str(source.get("id") or "").strip()
+        if not sid:
+            continue
+        for link in _active_links(smeta):
+            if link.get("type") != "references" or link.get("status") != "active":
+                continue
+            target_id = link.get("target_bucket_id") or ""
+            if target_id == sid or target_id not in by_id:
+                continue
+            tlinks = _active_links(by_id[target_id].get("metadata") or {})
+            has_reverse = any(
+                l.get("type") == "referenced_by"
+                and l.get("target_bucket_id") == sid
+                for l in tlinks
+            )
+            if not has_reverse:
+                missing.add((target_id, sid))
+    return sorted(missing)
