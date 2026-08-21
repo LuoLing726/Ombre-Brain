@@ -71,6 +71,7 @@ from tools import dream as _t_dream
 from tools import i as _t_i
 from tools import recall as _t_recall
 from tools import thread as _t_thread
+from tools import link as _t_link
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
 config = load_config()
@@ -964,6 +965,31 @@ async def thread(query: str, max_results: Optional[int] = 0) -> str:
         _t_thread.thread(query, max_results=max_results),
         op="thread",
         args={"query": query, "max_results": max_results},
+    )
+
+
+@mcp.tool()
+async def link(
+    bucket_id: str,
+    target_bucket_id: str,
+    relation_type: Optional[str] = "references",
+    label: Optional[str] = "",
+) -> str:
+    """补线：手动声明一条跨时间的边（经历连续，算法发现不了、只有活过的人知道）。给两条记忆的 bucket_id，把它们连起来。relation_type：references（A 正文提到了 B，默认）、continuation_of（A 是 B 的后续）、related_to（相关）。双向同步写、带 source=manual、幂等；软边只指方向，不删记忆、不 bump 活跃度。想连「自度的菩萨」和「重逢的告白」这类隔了几百条却是同一件事两端的珍珠，就用它。"""
+    return await _with_notice(
+        _t_link.link(
+            bucket_id=bucket_id,
+            target_bucket_id=target_bucket_id,
+            relation_type=relation_type,
+            label=label,
+        ),
+        op="link",
+        args={
+            "bucket_id": bucket_id,
+            "target_bucket_id": target_bucket_id,
+            "relation_type": relation_type,
+            "label": label,
+        },
     )
 
 

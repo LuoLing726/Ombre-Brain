@@ -63,10 +63,13 @@
 - 只碰读取 / 展示层。不碰写入、不碰建边、不碰遗忘/衰减、不碰原文证据、不碰删除/归档。
 - 因果边维持「不自动建」；读侧保留对存量因果边的显示。
 
-## 建的部分（待聊，先不动）
+## 建的部分（8月21日定案）
 
-- 经历线「补线」：要不要让模型能自己补一条漏掉的边（3.0.0 关闭的手动入口）。
-- 话题线「固化」：thread 现查现排 vs 预先归簇固化。
+- 经历线「补线」：✅ 开成 link 工具（手动声明一条边，3.0.0 关闭的手动入口重开）。
+  复用现有类型 + source=manual，开放 references / continuation_of / related_to 三种；
+  双向同步写、幂等、软边（只指方向不删记忆、不 bump 活跃度）。3.5.0 落地。
+- 话题线「固化」：❌ 先不做，thread 现查现排。将来按需 thread_pin（某话题反复
+  查询才冻成固定线，刷新挂 dream）。
 
 ## 环境变量 / 路径依赖
 
@@ -105,4 +108,7 @@
 - ✅ 已完成：写侧（create + 三条 hold 路径透传 event_time/references）+ 读侧（thread 排序、bucket_date、references 边渲染）+ 测试。
 - ✅ 已完成（3.4.1，8月21日续）：references 反向边自动补齐——dream 全量扫时幂等补 referenced_by（`collect_missing_reference_reverse` 纯判定 + `backfill_reference_reverse_links` 写入，挂 dream dispatch 的 fire-and-forget）。trace 工具新增 event_time 参数，支持事后修正（非空覆盖并标 manual）或清除（`\clear`，回到 created 回退）。
 - ❌ 不做（定案）：event_time 系统解析兜底（parsed 来源）——见上「结论」。
-- 版本：3.3.0 → 3.4.0 → 3.4.1。
+- ✅ 已完成（3.5.0，8月21日）：补线 link 工具（`src/tools/link/`）——手动声明
+  references / continuation_of / related_to 边，双向写 + source=manual + 幂等 +
+  软边；relation_store 的 normalize 保留 source 字段；server.py 注册 @mcp.tool。
+- 版本：3.3.0 → 3.4.0 → 3.4.1 → 3.5.0。

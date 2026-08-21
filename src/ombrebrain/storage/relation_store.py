@@ -205,6 +205,11 @@ def normalize_relation_links(value: Any) -> list[dict[str, str]]:
                 score = None
             if score is not None:
                 normalized["score"] = score
+        # source 标记边的来源：manual（模型手动声明，含 create 的 references 与
+        # link 补线）等。只在显式传入时保留，历史边不补标。
+        source = item.get("source")
+        if source:
+            normalized["source"] = str(source).strip()[:16]
         # V1 历史单向边没有 relation_id，保留原形不强制迁移。
         if relation_id:
             normalized["relation_id"] = relation_id
